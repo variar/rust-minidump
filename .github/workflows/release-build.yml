@@ -1,0 +1,58 @@
+name: "CI Build and Release"
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: ubuntu
+            os_version: 16.04
+            arch: x64
+            target: x86_64-unknown-linux-gnu
+
+          - os: macos
+            os_version: latest
+            arch: x64
+            target: x86_64-apple-darwin
+
+          - os: windows
+            os_version: latest
+            arch: x64
+            target: x86_64-pc-windows-msvc
+
+          - os: windows
+            os_version: latest
+            arch: x86
+            target: i686-pc-windows-msvc
+
+    runs-on: ${{ matrix.config.os }}-${{ matrix.config.os_version }}
+    
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Install toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+            toolchain: stable
+            override: true
+            target: ${{ matrix.config.target }}
+
+      - name: Set Mac target
+        if: ${{ matrix.config.os == 'macos' }} 
+        run: echo "::set-env name=MACOSX_DEPLOYMENT_TARGET::${{ 10.12 }}" 
+
+      - name: Build release
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v2
+        with:
+          name: release-${{ matrix.config.os }}-${{ matrix.config.arch }}
+          path: './target/release/minidump_dump*'
