@@ -14,6 +14,7 @@
 //! # Examples
 //!
 //! ```
+//! # std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
 //! use breakpad_symbols::{SimpleSymbolSupplier,Symbolizer,SimpleFrame,SimpleModule};
 //! use std::path::PathBuf;
 //! let paths = vec!(PathBuf::from("../testdata/symbols/"));
@@ -28,24 +29,11 @@
 //!               "vswprintf");
 //! ```
 
-#[macro_use]
-extern crate failure;
-#[macro_use]
-extern crate log;
-extern crate minidump_common;
-#[allow(unused_imports)]
-#[macro_use]
-extern crate nom;
-extern crate range_map;
-extern crate reqwest;
-#[cfg(test)]
-extern crate tempdir;
-
-mod sym_file;
-
 use failure::Error;
-pub use minidump_common::traits::Module;
-use reqwest::{Client, Url};
+use log::{debug, warn};
+use reqwest::blocking::Client;
+use reqwest::Url;
+
 use std::borrow::Cow;
 use std::boxed::Box;
 use std::cell::RefCell;
@@ -54,7 +42,12 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-pub use sym_file::SymbolFile;
+
+pub use minidump_common::traits::Module;
+
+pub use crate::sym_file::{CfiRules, SymbolFile};
+
+mod sym_file;
 
 /// A `Module` implementation that holds arbitrary data.
 ///
@@ -126,7 +119,8 @@ fn leafname(path: &str) -> &str {
 fn replace_or_add_extension(filename: &str, match_extension: &str, new_extension: &str) -> String {
     let mut bits = filename.split('.').collect::<Vec<_>>();
     if bits.len() > 1
-        && bits.last()
+        && bits
+            .last()
             .map_or(false, |e| e.to_lowercase() == match_extension)
     {
         bits.pop();
@@ -188,10 +182,10 @@ impl PartialEq for SymbolResult {
 
 impl fmt::Display for SymbolResult {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            &SymbolResult::Ok(_) => write!(f, "Ok"),
-            &SymbolResult::NotFound => write!(f, "Not found"),
-            &SymbolResult::LoadError(ref e) => write!(f, "Load error: {}", e),
+        match *self {
+            SymbolResult::Ok(_) => write!(f, "Ok"),
+            SymbolResult::NotFound => write!(f, "Not found"),
+            SymbolResult::LoadError(ref e) => write!(f, "Load error: {}", e),
         }
     }
 }
@@ -219,7 +213,7 @@ pub struct SimpleSymbolSupplier {
 impl SimpleSymbolSupplier {
     /// Instantiate a new `SimpleSymbolSupplier` that will search in `paths`.
     pub fn new(paths: Vec<PathBuf>) -> SimpleSymbolSupplier {
-        SimpleSymbolSupplier { paths: paths }
+        SimpleSymbolSupplier { paths }
     }
 }
 
@@ -230,8 +224,8 @@ impl SymbolSupplier for SimpleSymbolSupplier {
                 let test_path = path.join(&rel_path);
                 if fs::metadata(&test_path).ok().map_or(false, |m| m.is_file()) {
                     return SymbolFile::from_file(&test_path)
-                        .and_then(|s| Ok(SymbolResult::Ok(s)))
-                        .unwrap_or_else(|e| SymbolResult::LoadError(e));
+                        .map(SymbolResult::Ok)
+                        .unwrap_or_else(SymbolResult::LoadError);
                 }
             }
         }
@@ -261,16 +255,21 @@ impl HttpSymbolSupplier {
     ///
     /// Symbols will be searched for in each of `local_paths` and `cache` first, then via HTTP
     /// at each of `urls`. If a symbol file is found via HTTP it will be saved under `cache`.
-    pub fn new(urls: Vec<String>,
-               cache: PathBuf,
-               mut local_paths: Vec<PathBuf>) -> HttpSymbolSupplier {
+    pub fn new(
+        urls: Vec<String>,
+        cache: PathBuf,
+        mut local_paths: Vec<PathBuf>,
+    ) -> HttpSymbolSupplier {
         let client = Client::new();
-        let urls = urls.into_iter().filter_map(|mut u| {
-            if !u.ends_with("/") {
-                u.push('/');
-            }
-            Url::parse(&u).ok()
-        }).collect();
+        let urls = urls
+            .into_iter()
+            .filter_map(|mut u| {
+                if !u.ends_with('/') {
+                    u.push('/');
+                }
+                Url::parse(&u).ok()
+            })
+            .collect();
         local_paths.push(cache.clone());
         let local = SimpleSymbolSupplier::new(local_paths);
         HttpSymbolSupplier {
@@ -284,8 +283,9 @@ impl HttpSymbolSupplier {
 
 /// Save the data in `contents` to `path`.
 fn save_contents(contents: &[u8], path: &Path) -> io::Result<()> {
-    let base = path.parent().ok_or(io::Error::new(io::ErrorKind::Other,
-                                                  format!("Bad cache path: {:?}", path)))?;
+    let base = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, format!("Bad cache path: {:?}", path))
+    })?;
     fs::create_dir_all(&base)?;
     let mut f = File::create(path)?;
     f.write_all(contents)?;
@@ -294,9 +294,12 @@ fn save_contents(contents: &[u8], path: &Path) -> io::Result<()> {
 
 /// Fetch a symbol file from the URL made by combining `base_url` and `rel_path` using `client`,
 /// save the file contents under `cache` + `rel_path` and also return them.
-fn fetch_symbol_file(client: &Client, base_url: &Url, rel_path: &str,
-                     cache: &Path) -> Result<Vec<u8>, Error>
-{
+fn fetch_symbol_file(
+    client: &Client,
+    base_url: &Url,
+    rel_path: &str,
+    cache: &Path,
+) -> Result<Vec<u8>, Error> {
     let url = base_url.join(&rel_path)?;
     debug!("Trying {}", url);
     let mut res = client.get(url).send()?.error_for_status()?;
@@ -318,13 +321,12 @@ impl SymbolSupplier for HttpSymbolSupplier {
             SymbolResult::NotFound => {
                 if let Some(rel_path) = relative_symbol_path(module, "sym") {
                     for ref url in self.urls.iter() {
-                        match fetch_symbol_file(&self.client, url, &rel_path, &self.cache) {
-                            Ok(buf) => {
-                                return SymbolFile::from_bytes(&buf)
-                                    .and_then(|s| Ok(SymbolResult::Ok(s)))
-                                    .unwrap_or_else(|e| SymbolResult::LoadError(e));
-                            }
-                            Err(_) => {}
+                        if let Ok(buf) =
+                            fetch_symbol_file(&self.client, url, &rel_path, &self.cache)
+                        {
+                            return SymbolFile::from_bytes(&buf)
+                                .map(SymbolResult::Ok)
+                                .unwrap_or_else(SymbolResult::LoadError);
                         }
                     }
                 }
@@ -338,10 +340,30 @@ impl SymbolSupplier for HttpSymbolSupplier {
 pub trait FrameSymbolizer {
     /// Get the program counter value for this frame.
     fn get_instruction(&self) -> u64;
-    /// Set the name and base address of the function in which this frame is executing.
-    fn set_function(&mut self, name: &str, base: u64);
+    /// Set the name, base address, and paramter size of the function in
+    // which this frame is executing.
+    fn set_function(&mut self, name: &str, base: u64, parameter_size: u32);
     /// Set the source file and (1-based) line number this frame represents.
     fn set_source_file(&mut self, file: &str, line: u32, base: u64);
+}
+
+pub trait FrameWalker {
+    /// Get the instruction address that we're trying to unwind from.
+    fn get_instruction(&self) -> u64;
+    /// Get the number of bytes the callee's callee's parameters take up
+    /// on the stack (or 0 if unknown/invalid). This is needed for
+    /// STACK WIN unwinding.
+    fn get_grand_callee_parameter_size(&self) -> u32;
+    /// Get a register-sized value stored at this address.
+    fn get_register_at_address(&self, address: u64) -> Option<u64>;
+    /// Get the value of a register from the callee's frame.
+    fn get_callee_register(&self, name: &str) -> Option<u64>;
+    /// Set the value of a register for the caller's frame.
+    fn set_caller_register(&mut self, name: &str, val: u64) -> Option<()>;
+    /// Set whatever registers in the caller should be set based on the cfa (e.g. rsp).
+    fn set_cfa(&mut self, val: u64) -> Option<()>;
+    /// Set whatever registers in the caller should be set based on the return address (e.g. rip).
+    fn set_ra(&mut self, val: u64) -> Option<()>;
 }
 
 /// A simple implementation of `FrameSymbolizer` that just holds data.
@@ -353,6 +375,8 @@ pub struct SimpleFrame {
     pub function: Option<String>,
     /// The offset of the start of `function` from the module base.
     pub function_base: Option<u64>,
+    /// The size, in bytes, that this function's parameters take up on the stack.
+    pub parameter_size: Option<u32>,
     /// The name of the source file in which the current instruction is executing.
     pub source_file: Option<String>,
     /// The 1-based index of the line number in `source_file` in which the current instruction is
@@ -366,7 +390,7 @@ impl SimpleFrame {
     /// Instantiate a `SimpleFrame` with instruction pointer `instruction`.
     pub fn with_instruction(instruction: u64) -> SimpleFrame {
         SimpleFrame {
-            instruction: instruction,
+            instruction,
             ..SimpleFrame::default()
         }
     }
@@ -376,9 +400,10 @@ impl FrameSymbolizer for SimpleFrame {
     fn get_instruction(&self) -> u64 {
         self.instruction
     }
-    fn set_function(&mut self, name: &str, base: u64) {
+    fn set_function(&mut self, name: &str, base: u64, parameter_size: u32) {
         self.function = Some(String::from(name));
         self.function_base = Some(base);
+        self.parameter_size = Some(parameter_size);
     }
     fn set_source_file(&mut self, file: &str, line: u32, base: u64) {
         self.source_file = Some(String::from(file));
@@ -466,6 +491,7 @@ impl Symbolizer {
     /// # Examples
     ///
     /// ```
+    /// # std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
     /// use breakpad_symbols::{SimpleSymbolSupplier,Symbolizer,SimpleFrame,SimpleModule};
     /// use std::path::PathBuf;
     /// let paths = vec!(PathBuf::from("../testdata/symbols/"));
@@ -483,18 +509,27 @@ impl Symbolizer {
     /// [simpleframe]: struct.SimpleFrame.html
     pub fn fill_symbol(&self, module: &dyn Module, frame: &mut dyn FrameSymbolizer) {
         let k = key(module);
+        self.ensure_module(module, &k);
+        if let Some(SymbolResult::Ok(ref sym)) = self.symbols.borrow().get(&k) {
+            sym.fill_symbol(module, frame)
+        }
+    }
+
+    pub fn walk_frame(&self, module: &dyn Module, walker: &mut dyn FrameWalker) -> Option<()> {
+        let k = key(module);
+        self.ensure_module(module, &k);
+        if let Some(SymbolResult::Ok(ref sym)) = self.symbols.borrow().get(&k) {
+            sym.walk_frame(module, walker)
+        } else {
+            None
+        }
+    }
+
+    fn ensure_module(&self, module: &dyn Module, k: &ModuleKey) {
         if !self.symbols.borrow().contains_key(&k) {
             let res = self.supplier.locate_symbols(module);
             debug!("locate_symbols for {}: {}", module.code_file(), res);
-            self.symbols
-                .borrow_mut()
-                .insert(k.clone(), res);
-        }
-        if let Some(res) = self.symbols.borrow().get(&k) {
-            match res {
-                &SymbolResult::Ok(ref sym) => sym.fill_symbol(module, frame),
-                _ => {}
-            }
+            self.symbols.borrow_mut().insert(k.clone(), res);
         }
     }
 }
@@ -647,7 +682,8 @@ mod test {
         for &(path, file, id, sym) in [
             (&paths[0], "foo.pdb", "abcd1234", "foo.pdb/abcd1234/foo.sym"),
             (&paths[1], "bar.xyz", "ff9900", "bar.xyz/ff9900/bar.xyz.sym"),
-        ].iter()
+        ]
+        .iter()
         {
             let m = SimpleModule::new(file, id);
             // No symbols present yet.
@@ -655,11 +691,8 @@ mod test {
             write_good_symbol_file(&path.join(sym));
             // Should load OK now that it exists.
             assert!(
-                if let SymbolResult::Ok(_) = supplier.locate_symbols(&m) {
-                    true
-                } else {
-                    false
-                },
+                matches!(supplier.locate_symbols(&m), SymbolResult::Ok(_)),
+                "{}",
                 format!("Located symbols for {}", sym)
             );
         }
@@ -671,11 +704,8 @@ mod test {
         write_bad_symbol_file(&paths[0].join(sym));
         let res = supplier.locate_symbols(&mal);
         assert!(
-            if let SymbolResult::LoadError(_) = res {
-                true
-            } else {
-                false
-            },
+            matches!(res, SymbolResult::LoadError(_)),
+            "{}",
             format!("Correctly failed to parse {}, result: {:?}", sym, res)
         );
     }
@@ -735,11 +765,8 @@ FUNC 1000 30 10 another func
         assert!(f2.source_file.is_none());
         assert!(f2.source_line.is_none());
         // This should also use cached results.
-        assert!(
-            symbolizer
-                .get_symbol_at_address("bar.pdb", "ffff0000", 0x1010)
-                .is_none()
-        );
+        assert!(symbolizer
+            .get_symbol_at_address("bar.pdb", "ffff0000", 0x1010)
+            .is_none());
     }
-
 }

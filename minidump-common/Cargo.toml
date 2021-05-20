@@ -8,6 +8,7 @@ license = "MIT"
 documentation = "https://docs.rs/minidump-common"
 homepage = "https://github.com/luser/rust-minidump"
 repository = "https://github.com/luser/rust-minidump"
+edition = "2018"
 
 [badges]
 travis-ci = { repository = "luser/rust-minidump" }
@@ -18,6 +19,6 @@ libc = "0.2.34"
 log = "0.4.1"
 num-traits = "0.2"
 range-map = "0.1.5"
-scroll = { version = "0.9.0", features = ["derive"] }
+scroll = { version = "0.10.2", features = ["derive"] }
 smart-default = "0.2.0"
 bitflags = "1.0.4"

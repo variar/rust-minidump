@@ -1,34 +1,35 @@
 // Copyright 2015 Ted Mielczarek. See the COPYRIGHT
 // file at the top-level directory of this distribution.
 
-use std::io::prelude::*;
-use std::marker::PhantomData;
 use chrono::prelude::*;
 use encoding::all::UTF_16LE;
 use encoding::{DecoderTrap, Encoding};
-use failure;
+use failure::Fail;
 use memmap::Mmap;
 use num_traits::FromPrimitive;
-use scroll::{self, BE, LE, Pread};
 use scroll::ctx::{SizeWith, TryFromCtx};
+use scroll::{self, Pread, BE, LE};
 use std::borrow::Cow;
 use std::boxed::Box;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::io::prelude::*;
 use std::iter;
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::path::Path;
 use std::str;
 
-pub use context::*;
-use minidump_common::traits::{IntoRangeMapSafe, Module};
+pub use crate::context::*;
+use crate::system_info::{Cpu, Os};
 use minidump_common::format as md;
 use minidump_common::format::{CvSignature, MINIDUMP_STREAM_TYPE};
+use minidump_common::traits::{IntoRangeMapSafe, Module};
 use range_map::{Range, RangeMap};
-use system_info::{Cpu, Os};
 
 /// An index into the contents of a minidump.
 ///
@@ -50,9 +51,10 @@ use system_info::{Cpu, Os};
 ///
 /// [read]: struct.Minidump.html#method.read
 /// [read_path]: struct.Minidump.html#method.read_path
-#[allow(dead_code)]
+#[derive(Debug)]
 pub struct Minidump<'a, T>
-    where T: Deref<Target=[u8]> + 'a,
+where
+    T: Deref<Target = [u8]> + 'a,
 {
     data: T,
     /// The raw minidump header from the file.
@@ -69,7 +71,7 @@ pub enum Error {
     #[fail(display = "File not found")]
     FileNotFound,
     #[fail(display = "I/O error")]
-    IOError,
+    IoError,
     #[fail(display = "Missing minidump header")]
     MissingHeader,
     #[fail(display = "Header mismatch")]
@@ -80,7 +82,10 @@ pub enum Error {
     MissingDirectory,
     #[fail(display = "Error reading stream")]
     StreamReadFailure,
-    #[fail(display = "Stream size mismatch: expected {} byes, found {} bytes", expected, actual)]
+    #[fail(
+        display = "Stream size mismatch: expected {} byes, found {} bytes",
+        expected, actual
+    )]
     StreamSizeMismatch { expected: usize, actual: usize },
     #[fail(display = "Stream not found")]
     StreamNotFound,
@@ -111,7 +116,7 @@ pub trait MinidumpStream<'a>: Sized {
 }
 
 /// CodeView data describes how to locate debug symbols
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum CodeView {
     /// PDB 2.0 format data in a separate file
     Pdb20(md::CV_INFO_PDB20),
@@ -124,12 +129,12 @@ pub enum CodeView {
 }
 
 /// An executable or shared library loaded in the process at the time the `Minidump` was written.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MinidumpModule {
     /// The `MINIDUMP_MODULE` direct from the minidump file.
     pub raw: md::MINIDUMP_MODULE,
     /// The module name. This is stored separately in the minidump.
-    name: String,
+    pub name: String,
     /// A `CodeView` record, if one is present.
     pub codeview_info: Option<CodeView>,
     /// A misc debug record, if one is present.
@@ -137,7 +142,7 @@ pub struct MinidumpModule {
 }
 
 /// A list of `MinidumpModule`s contained in a `Minidump`.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MinidumpModuleList {
     /// The modules, in the order they were stored in the minidump.
     modules: Vec<MinidumpModule>,
@@ -145,7 +150,28 @@ pub struct MinidumpModuleList {
     modules_by_addr: RangeMap<u64, usize>,
 }
 
+/// An executable or shared library that was once loaded into the process, but was unloaded
+/// by the time the `Minidump` was written.
+#[derive(Debug, Clone)]
+pub struct MinidumpUnloadedModule {
+    /// The `MINIDUMP_UNLOADED_MODULE` direct from the minidump file.
+    pub raw: md::MINIDUMP_UNLOADED_MODULE,
+    /// The module name. This is stored separately in the minidump.
+    pub name: String,
+}
+
+/// A list of `MinidumpUnloadedModule`s contained in a `Minidump`.
+#[derive(Debug, Clone)]
+pub struct MinidumpUnloadedModuleList {
+    /// The modules, in the order they were stored in the minidump.
+    modules: Vec<MinidumpUnloadedModule>,
+    /// Map from address range to index in modules.
+    /// Use `MinidumpUnloadedModuleList::module_at_address`.
+    modules_by_addr: RangeMap<u64, usize>,
+}
+
 /// The state of a thread from the process when the minidump was written.
+#[derive(Debug)]
 pub struct MinidumpThread<'a> {
     /// The `MINIDUMP_THREAD` direct from the minidump file.
     pub raw: md::MINIDUMP_THREAD,
@@ -156,6 +182,7 @@ pub struct MinidumpThread<'a> {
 }
 
 /// A list of `MinidumpThread`s contained in a `Minidump`.
+#[derive(Debug)]
 pub struct MinidumpThreadList<'a> {
     /// The threads, in the order they were present in the `Minidump`.
     pub threads: Vec<MinidumpThread<'a>>,
@@ -164,6 +191,7 @@ pub struct MinidumpThreadList<'a> {
 }
 
 /// Information about the system that generated the minidump.
+#[derive(Debug)]
 pub struct MinidumpSystemInfo {
     /// The `MINIDUMP_SYSTEM_INFO` direct from the minidump
     pub raw: md::MINIDUMP_SYSTEM_INFO,
@@ -171,9 +199,17 @@ pub struct MinidumpSystemInfo {
     pub os: Os,
     /// The CPU on which the minidump was generated
     pub cpu: Cpu,
+    /// A string that describes the latest Service Pack installed on the system.
+    /// If no Service Pack has been installed, the string is empty.
+    /// This is stored separately in the minidump.
+    csd_version: Option<String>,
+    /// An x86 (not x64!) CPU vendor name that is stored in `raw` but in a way
+    /// that's
+    cpu_info: Option<String>,
 }
 
 /// A region of memory from the process that wrote the minidump.
+#[derive(Debug)]
 pub struct MinidumpMemory<'a> {
     /// The raw `MINIDUMP_MEMORY_DESCRIPTOR` from the minidump.
     pub desc: md::MINIDUMP_MEMORY_DESCRIPTOR,
@@ -185,14 +221,18 @@ pub struct MinidumpMemory<'a> {
     pub bytes: &'a [u8],
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum RawMiscInfo {
     MiscInfo(md::MINIDUMP_MISC_INFO),
-    MiscInfo2(md::MINIDUMP_MISC_INFO2),
-    MiscInfo3(md::MINIDUMP_MISC_INFO3),
-    MiscInfo4(md::MINIDUMP_MISC_INFO4),
+    MiscInfo2(md::MINIDUMP_MISC_INFO_2),
+    MiscInfo3(md::MINIDUMP_MISC_INFO_3),
+    MiscInfo4(md::MINIDUMP_MISC_INFO_4),
+    MiscInfo5(md::MINIDUMP_MISC_INFO_5),
 }
 
 /// Miscellaneous information about the process that wrote the minidump.
+#[derive(Debug)]
 pub struct MinidumpMiscInfo {
     /// The `MINIDUMP_MISC_INFO` struct direct from the minidump.
     pub raw: RawMiscInfo,
@@ -203,6 +243,7 @@ pub struct MinidumpMiscInfo {
 /// MinidumpBreakpadInfo wraps MINIDUMP_BREAKPAD_INFO, which is an optional stream
 /// in a minidump that provides additional information about the process state
 /// at the time the minidump was generated.
+#[derive(Debug)]
 pub struct MinidumpBreakpadInfo {
     raw: md::MINIDUMP_BREAKPAD_INFO,
     /// The thread that wrote the minidump.
@@ -225,6 +266,7 @@ pub enum CrashReason {
 /// exception.  It also provides access to a `MinidumpContext` object, which
 /// contains the CPU context for the exception thread at the time the exception
 /// occurred.
+#[derive(Debug)]
 pub struct MinidumpException {
     /// The raw exception information from the minidump stream.
     pub raw: md::MINIDUMP_EXCEPTION_STREAM,
@@ -240,6 +282,7 @@ pub struct MinidumpException {
 }
 
 /// A list of memory regions included in a minidump.
+#[derive(Debug)]
 pub struct MinidumpMemoryList<'a> {
     /// The memory regions, in the order they were stored in the minidump.
     regions: Vec<MinidumpMemory<'a>>,
@@ -248,8 +291,53 @@ pub struct MinidumpMemoryList<'a> {
 }
 
 /// Information about an assertion that caused a crash.
+#[derive(Debug)]
 pub struct MinidumpAssertion {
     pub raw: md::MINIDUMP_ASSERTION_INFO,
+}
+
+/// A typed annotation object.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum MinidumpAnnotation {
+    /// An invalid annotation. Reserved for internal use.
+    Invalid,
+    /// A `NUL`-terminated C-string.
+    String(String),
+    /// Clients may declare their own custom types.
+    UserDefined(md::MINIDUMP_ANNOTATION),
+    /// An unsupported annotation from a future crashpad version.
+    Unsupported(md::MINIDUMP_ANNOTATION),
+}
+
+impl PartialEq for MinidumpAnnotation {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Invalid, Self::Invalid) => true,
+            (Self::String(a), Self::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Additional Crashpad-specific information about a module carried within a minidump file.
+#[derive(Debug)]
+pub struct MinidumpModuleCrashpadInfo {
+    /// The raw crashpad module extension information.
+    pub raw: md::MINIDUMP_MODULE_CRASHPAD_INFO,
+    /// Index of the corresponding module in the `MinidumpModuleList`.
+    pub module_index: usize,
+    pub list_annotations: Vec<String>,
+    pub simple_annotations: BTreeMap<String, String>,
+    pub annotation_objects: BTreeMap<String, MinidumpAnnotation>,
+}
+
+/// Additional Crashpad-specific information carried within a minidump file.
+#[derive(Debug)]
+pub struct MinidumpCrashpadInfo {
+    pub raw: md::MINIDUMP_CRASHPAD_INFO,
+    pub simple_annotations: BTreeMap<String, String>,
+    pub module_list: Vec<MinidumpModuleCrashpadInfo>,
 }
 
 //======================================================
@@ -263,27 +351,49 @@ fn format_time_t(t: u32) -> String {
     }
 }
 
-/// Produce a slice of `bytes` corresponding to the offset and size in `loc`, or an
-/// `Error` if the data is not fully contained within `bytes`.
-fn location_slice<'a>(bytes: &'a [u8], loc: &md::MINIDUMP_LOCATION_DESCRIPTOR) -> Result<&'a [u8], Error> {
-    let start = loc.rva as usize;
-    let end = (loc.rva + loc.data_size) as usize;
-    if start < bytes.len() && end <= bytes.len() {
-        Ok(&bytes[start..end])
+fn format_system_time(time: &md::SYSTEMTIME) -> String {
+    // Note this drops the day_of_week field on the ground -- is that fine?
+    if let Some(date) =
+        NaiveDate::from_ymd_opt(time.year as i32, time.month as u32, time.day as u32)
+    {
+        let time = NaiveTime::from_hms_milli(
+            time.hour as u32,
+            time.minute as u32,
+            time.second as u32,
+            time.milliseconds as u32,
+        );
+        let datetime = NaiveDateTime::new(date, time);
+        datetime.format("%Y-%m-%d %H:%M:%S:%f").to_string()
     } else {
-        Err(Error::StreamReadFailure)
+        "<invalid date>".to_owned()
     }
 }
 
+/// Produce a slice of `bytes` corresponding to the offset and size in `loc`, or an
+/// `Error` if the data is not fully contained within `bytes`.
+fn location_slice<'a>(
+    bytes: &'a [u8],
+    loc: &md::MINIDUMP_LOCATION_DESCRIPTOR,
+) -> Result<&'a [u8], Error> {
+    let start = loc.rva as usize;
+    start
+        .checked_add(loc.data_size as usize)
+        .and_then(|end| bytes.get(start..end))
+        .ok_or(Error::StreamReadFailure)
+}
+
 /// Read a u32 length-prefixed UTF-16 string from `bytes` at `offset`.
-fn read_string_utf16(offset: &mut usize, bytes: &[u8],
-                     endian: scroll::Endian) -> Result<String, ()> {
+fn read_string_utf16(
+    offset: &mut usize,
+    bytes: &[u8],
+    endian: scroll::Endian,
+) -> Result<String, ()> {
     let u: u32 = bytes.gread_with(offset, endian).or(Err(()))?;
     let size = u as usize;
     if size % 2 != 0 || (*offset + size) > bytes.len() {
         return Err(());
     }
-    match UTF_16LE.decode(&bytes[*offset..*offset+size], DecoderTrap::Strict) {
+    match UTF_16LE.decode(&bytes[*offset..*offset + size], DecoderTrap::Strict) {
         Ok(s) => {
             *offset += size;
             Ok(s)
@@ -292,9 +402,33 @@ fn read_string_utf16(offset: &mut usize, bytes: &[u8],
     }
 }
 
+#[inline]
+fn read_string_utf8_unterminated<'a>(
+    offset: &mut usize,
+    bytes: &'a [u8],
+    endian: scroll::Endian,
+) -> Result<&'a str, ()> {
+    let length: u32 = bytes.gread_with(offset, endian).or(Err(()))?;
+    let slice = bytes.gread_with(offset, length as usize).or(Err(()))?;
+    std::str::from_utf8(slice).or(Err(()))
+}
+
+fn read_string_utf8<'a>(
+    offset: &mut usize,
+    bytes: &'a [u8],
+    endian: scroll::Endian,
+) -> Result<&'a str, ()> {
+    let string = read_string_utf8_unterminated(offset, bytes, endian)?;
+    match bytes.gread(offset) {
+        Ok(0u8) => Ok(string),
+        _ => Err(()),
+    }
+}
+
 /// Convert `bytes` with trailing NUL characters to a string
-fn string_from_bytes_nul(bytes: &[u8]) -> Option<Cow<str>> {
-    bytes.split(|&b| b == 0)
+fn string_from_bytes_nul(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    bytes
+        .split(|&b| b == 0)
         .next()
         .map(|b| String::from_utf8_lossy(b))
 }
@@ -306,8 +440,11 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 }
 
 /// Attempt to read a CodeView record from `data` at `location`
-fn read_codeview(location: &md::MINIDUMP_LOCATION_DESCRIPTOR, data: &[u8],
-                 endian: scroll::Endian) -> Result<CodeView, failure::Error> {
+fn read_codeview(
+    location: &md::MINIDUMP_LOCATION_DESCRIPTOR,
+    data: &[u8],
+    endian: scroll::Endian,
+) -> Result<CodeView, failure::Error> {
     let bytes = location_slice(data, location)?;
     // The CodeView data can be one of a few different formats. Try to read the
     // signature first to figure out what format the data is.
@@ -319,7 +456,7 @@ fn read_codeview(location: &md::MINIDUMP_LOCATION_DESCRIPTOR, data: &[u8],
         // Breakpad's ELF build ID format.
         Some(CvSignature::Elf) => CodeView::Elf(bytes.pread_with(0, endian)?),
         // Other formats aren't handled, but save the raw bytes.
-        _ => CodeView::Unknown(bytes.to_owned())
+        _ => CodeView::Unknown(bytes.to_owned()),
     })
 }
 
@@ -342,11 +479,14 @@ impl MinidumpModule {
 
     /// Read additional data to construct a `MinidumpModule` from `bytes` using the information
     /// from the module list in `raw`.
-    pub fn read(raw: md::MINIDUMP_MODULE, bytes: &[u8],
-                endian: scroll::Endian) -> Result<MinidumpModule, Error> {
+    pub fn read(
+        raw: md::MINIDUMP_MODULE,
+        bytes: &[u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpModule, Error> {
         let mut offset = raw.module_name_rva as usize;
-        let name = read_string_utf16(&mut offset, bytes, endian)
-            .or(Err(Error::CodeViewReadFailure))?;
+        let name =
+            read_string_utf16(&mut offset, bytes, endian).or(Err(Error::CodeViewReadFailure))?;
         let codeview_info = if raw.cv_record.data_size == 0 {
             None
         } else {
@@ -418,8 +558,8 @@ impl MinidumpModule {
         // Print CodeView data.
         match self.codeview_info {
             Some(CodeView::Pdb70(ref raw)) => {
-                let pdb_file_name = string_from_bytes_nul(&raw.pdb_file_name)
-                    .unwrap_or(Cow::Borrowed("(invalid)"));
+                let pdb_file_name =
+                    string_from_bytes_nul(&raw.pdb_file_name).unwrap_or(Cow::Borrowed("(invalid)"));
                 write!(f, "  (cv_record).cv_signature        = {:#x}
   (cv_record).signature           = {:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}
   (cv_record).age                 = {}
@@ -442,8 +582,8 @@ impl MinidumpModule {
                 )?;
             }
             Some(CodeView::Pdb20(ref raw)) => {
-                let pdb_file_name = string_from_bytes_nul(&raw.pdb_file_name)
-                    .unwrap_or(Cow::Borrowed("(invalid)"));
+                let pdb_file_name =
+                    string_from_bytes_nul(&raw.pdb_file_name).unwrap_or(Cow::Borrowed("(invalid)"));
                 write!(
                     f,
                     "  (cv_record).cv_header.signature = {:#x}
@@ -486,10 +626,7 @@ impl MinidumpModule {
         // Print misc record data.
         if let Some(ref _misc) = self.misc_info {
             //TODO, not terribly important.
-            writeln!(
-                f,
-                "  (misc_record)                   = (unimplemented)"
-            )?;
+            writeln!(f, "  (misc_record)                   = (unimplemented)")?;
         } else {
             writeln!(f, "  (misc_record)                   = (null)")?;
         }
@@ -514,23 +651,6 @@ impl MinidumpModule {
     }
 }
 
-fn guid_to_string(guid: &md::GUID) -> String {
-    format!(
-        "{:08X}{:04X}{:04X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        guid.data1,
-        guid.data2,
-        guid.data3,
-        guid.data4[0],
-        guid.data4[1],
-        guid.data4[2],
-        guid.data4[3],
-        guid.data4[4],
-        guid.data4[5],
-        guid.data4[6],
-        guid.data4[7],
-    )
-}
-
 impl Module for MinidumpModule {
     fn base_address(&self) -> u64 {
         self.raw.base_of_image
@@ -538,10 +658,10 @@ impl Module for MinidumpModule {
     fn size(&self) -> u64 {
         self.raw.size_of_image as u64
     }
-    fn code_file(&self) -> Cow<str> {
+    fn code_file(&self) -> Cow<'_, str> {
         Cow::Borrowed(&self.name)
     }
-    fn code_identifier(&self) -> Cow<str> {
+    fn code_identifier(&self) -> Cow<'_, str> {
         match self.codeview_info {
             Some(CodeView::Elf(ref raw)) => Cow::Owned(bytes_to_hex(&raw.build_id)),
             _ => {
@@ -553,7 +673,7 @@ impl Module for MinidumpModule {
             }
         }
     }
-    fn debug_file(&self) -> Option<Cow<str>> {
+    fn debug_file(&self) -> Option<Cow<'_, str>> {
         match self.codeview_info {
             Some(CodeView::Pdb70(ref raw)) => string_from_bytes_nul(&raw.pdb_file_name),
             Some(CodeView::Pdb20(ref raw)) => string_from_bytes_nul(&raw.pdb_file_name),
@@ -562,10 +682,10 @@ impl Module for MinidumpModule {
             _ => None,
         }
     }
-    fn debug_identifier(&self) -> Option<Cow<str>> {
+    fn debug_identifier(&self) -> Option<Cow<'_, str>> {
         match self.codeview_info {
             Some(CodeView::Pdb70(ref raw)) => {
-                let id = format!("{}{:x}", guid_to_string(&raw.signature), raw.age,);
+                let id = format!("{:#}{:x}", raw.signature, raw.age,);
                 Some(Cow::Owned(id))
             }
             Some(CodeView::Pdb20(ref raw)) => {
@@ -579,41 +699,144 @@ impl Module for MinidumpModule {
                 let guid_size = <md::GUID>::size_with(&LE);
                 let guid = if raw.build_id.len() < guid_size {
                     // Pad with zeros.
-                    let v: Vec<u8> = raw.build_id.iter()
-                        .cloned().chain(iter::repeat(0)).take(guid_size).collect();
+                    let v: Vec<u8> = raw
+                        .build_id
+                        .iter()
+                        .cloned()
+                        .chain(iter::repeat(0))
+                        .take(guid_size)
+                        .collect();
                     v.pread_with::<md::GUID>(0, LE).ok()
                 } else {
                     raw.build_id.pread_with::<md::GUID>(0, LE).ok()
                 };
-                guid.map(|g| Cow::Owned(format!("{}0", guid_to_string(&g))))
+                guid.map(|g| Cow::Owned(format!("{:#}0", g)))
             }
             _ => None,
         }
     }
-    fn version(&self) -> Option<Cow<str>> {
+    fn version(&self) -> Option<Cow<'_, str>> {
         if self.raw.version_info.signature == md::VS_FFI_SIGNATURE
-            && self.raw.version_info.struct_version == md::VS_FFI_STRUCVERSION {
-                let ver = format!(
-                    "{}.{}.{}.{}",
-                    self.raw.version_info.file_version_hi >> 16,
-                    self.raw.version_info.file_version_hi & 0xffff,
-                    self.raw.version_info.file_version_lo >> 16,
-                    self.raw.version_info.file_version_lo & 0xffff
-                );
-                Some(Cow::Owned(ver))
-            } else {
-                None
-            }
+            && self.raw.version_info.struct_version == md::VS_FFI_STRUCVERSION
+        {
+            let ver = format!(
+                "{}.{}.{}.{}",
+                self.raw.version_info.file_version_hi >> 16,
+                self.raw.version_info.file_version_hi & 0xffff,
+                self.raw.version_info.file_version_lo >> 16,
+                self.raw.version_info.file_version_lo & 0xffff
+            );
+            Some(Cow::Owned(ver))
+        } else {
+            None
+        }
     }
 }
 
-fn read_stream_list<'a, T>(offset: &mut usize, bytes: &'a [u8], endian: scroll::Endian) -> Result<Vec<T>, Error>
-    where T: TryFromCtx<'a, scroll::Endian, [u8], Error=scroll::Error, Size=usize>,
-          T: SizeWith<scroll::Endian, Units=usize>,
+impl MinidumpUnloadedModule {
+    /// Create a `MinidumpUnloadedModule` with some basic info.
+    ///
+    /// Useful for testing.
+    pub fn new(base: u64, size: u32, name: &str) -> MinidumpUnloadedModule {
+        MinidumpUnloadedModule {
+            raw: md::MINIDUMP_UNLOADED_MODULE {
+                base_of_image: base,
+                size_of_image: size,
+                ..md::MINIDUMP_UNLOADED_MODULE::default()
+            },
+            name: String::from(name),
+        }
+    }
+
+    /// Read additional data to construct a `MinidumpUnloadedModule` from `bytes` using the information
+    /// from the module list in `raw`.
+    pub fn read(
+        raw: md::MINIDUMP_UNLOADED_MODULE,
+        bytes: &[u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpUnloadedModule, Error> {
+        let mut offset = raw.module_name_rva as usize;
+        let name = read_string_utf16(&mut offset, bytes, endian).or(Err(Error::DataError))?;
+        Ok(MinidumpUnloadedModule { raw, name })
+    }
+
+    /// Write a human-readable description of this `MinidumpModule` to `f`.
+    ///
+    /// This is very verbose, it is the format used by `minidump_dump`.
+    pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
+        write!(
+            f,
+            "MINIDUMP_UNLOADED_MODULE
+  base_of_image                   = {:#x}
+  size_of_image                   = {:#x}
+  checksum                        = {:#x}
+  time_date_stamp                 = {:#x} {}
+  module_name_rva                 = {:#x}
+  (code_file)                     = \"{}\"
+  (code_identifier)               = \"{}\"
+",
+            self.raw.base_of_image,
+            self.raw.size_of_image,
+            self.raw.checksum,
+            self.raw.time_date_stamp,
+            format_time_t(self.raw.time_date_stamp),
+            self.raw.module_name_rva,
+            self.code_file(),
+            self.code_identifier(),
+        )?;
+
+        Ok(())
+    }
+
+    fn memory_range(&self) -> Range<u64> {
+        Range::new(self.base_address(), self.base_address() + self.size() - 1)
+    }
+}
+
+impl Module for MinidumpUnloadedModule {
+    fn base_address(&self) -> u64 {
+        self.raw.base_of_image
+    }
+    fn size(&self) -> u64 {
+        self.raw.size_of_image as u64
+    }
+    fn code_file(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
+    }
+    fn code_identifier(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "{0:08X}{1:x}",
+            self.raw.time_date_stamp, self.raw.size_of_image
+        ))
+    }
+    fn debug_file(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+    fn debug_identifier(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+    fn version(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+}
+
+fn read_stream_list<'a, T>(
+    offset: &mut usize,
+    bytes: &'a [u8],
+    endian: scroll::Endian,
+) -> Result<Vec<T>, Error>
+where
+    T: TryFromCtx<'a, scroll::Endian, [u8], Error = scroll::Error>,
+    T: SizeWith<scroll::Endian>,
 {
-    let u: u32 = bytes.gread_with(offset, endian).or(Err(Error::StreamReadFailure))?;
+    let u: u32 = bytes
+        .gread_with(offset, endian)
+        .or(Err(Error::StreamReadFailure))?;
     let count = u as usize;
-    let counted_size = match count.checked_mul(<T>::size_with(&endian)).and_then(|v| v.checked_add(mem::size_of::<u32>())) {
+    let counted_size = match count
+        .checked_mul(<T>::size_with(&endian))
+        .and_then(|v| v.checked_add(mem::size_of::<u32>()))
+    {
         Some(s) => s,
         None => return Err(Error::StreamReadFailure),
     };
@@ -639,23 +862,84 @@ fn read_stream_list<'a, T>(offset: &mut usize, bytes: &'a [u8], endian: scroll::
     // read count T raw stream entries
     let mut raw_entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let raw: T = bytes.gread_with(offset, endian).or(Err(Error::StreamReadFailure))?;
+        let raw: T = bytes
+            .gread_with(offset, endian)
+            .or(Err(Error::StreamReadFailure))?;
         raw_entries.push(raw);
     }
     Ok(raw_entries)
 }
 
-/// An iterator over `MinidumpModule`s.
-pub struct Modules<'a> {
-    iter: Box<dyn Iterator<Item = &'a MinidumpModule> + 'a>,
-}
+fn read_ex_stream_list<'a, T>(
+    offset: &mut usize,
+    bytes: &'a [u8],
+    endian: scroll::Endian,
+) -> Result<Vec<T>, Error>
+where
+    T: TryFromCtx<'a, scroll::Endian, [u8], Error = scroll::Error>,
+    T: SizeWith<scroll::Endian>,
+{
+    // Some newer list streams have an extended header:
+    //
+    // size_of_header: u32,
+    // size_of_entry: u32,
+    // number_of_entries: u32,
+    // ...entries
 
-impl<'a> Iterator for Modules<'a> {
-    type Item = &'a MinidumpModule;
+    // In theory this allows the format of the stream to be extended without
+    // us knowing how to handle the new parts.
 
-    fn next(&mut self) -> Option<&'a MinidumpModule> {
-        self.iter.next()
+    let size_of_header: u32 = bytes
+        .gread_with(offset, endian)
+        .or(Err(Error::StreamReadFailure))?;
+
+    let size_of_entry: u32 = bytes
+        .gread_with(offset, endian)
+        .or(Err(Error::StreamReadFailure))?;
+
+    let number_of_entries: u32 = bytes
+        .gread_with(offset, endian)
+        .or(Err(Error::StreamReadFailure))?;
+
+    let expected_size_of_entry = <T>::size_with(&endian);
+
+    if size_of_entry as usize != expected_size_of_entry {
+        // For now, conservatively bail out if entries don't have
+        // the expected size. In theory we can assume entries are
+        // always extended with new trailing fields, and this information
+        // would let us walk over trailing fields we don't know about?
+        // But without an example let's be safe.
+        return Err(Error::StreamReadFailure);
     }
+
+    let stream_size = match number_of_entries
+        .checked_mul(size_of_entry)
+        .and_then(|v| v.checked_add(size_of_header))
+    {
+        Some(s) => s as usize,
+        None => return Err(Error::StreamReadFailure),
+    };
+    if bytes.len() < stream_size {
+        return Err(Error::StreamSizeMismatch {
+            expected: stream_size,
+            actual: bytes.len(),
+        });
+    }
+    let header_padding = match (size_of_header as usize).checked_sub(*offset) {
+        Some(s) => s,
+        None => return Err(Error::StreamReadFailure),
+    };
+    *offset += header_padding;
+
+    // read count T raw stream entries
+    let mut raw_entries = Vec::with_capacity(number_of_entries as usize);
+    for _ in 0..number_of_entries {
+        let raw: T = bytes
+            .gread_with(offset, endian)
+            .or(Err(Error::StreamReadFailure))?;
+        raw_entries.push(raw);
+    }
+    Ok(raw_entries)
 }
 
 impl MinidumpModuleList {
@@ -668,8 +952,11 @@ impl MinidumpModuleList {
     }
     /// Create a `MinidumpModuleList` from a list of `MinidumpModule`s.
     pub fn from_modules(modules: Vec<MinidumpModule>) -> MinidumpModuleList {
-        let modules_by_addr = modules.iter().enumerate()
-            .map(|(i, module)| (module.memory_range(), i)).into_rangemap_safe();
+        let modules_by_addr = modules
+            .iter()
+            .enumerate()
+            .map(|(i, module)| (module.memory_range(), i))
+            .into_rangemap_safe();
         MinidumpModuleList {
             modules,
             modules_by_addr,
@@ -680,7 +967,7 @@ impl MinidumpModuleList {
     pub fn main_module(&self) -> Option<&MinidumpModule> {
         // The main code module is the first one present in a minidump file's
         // MINIDUMP_MODULEList.
-        if self.modules.len() > 0 {
+        if !self.modules.is_empty() {
             Some(&self.modules[0])
         } else {
             None
@@ -689,26 +976,21 @@ impl MinidumpModuleList {
 
     /// Return a `MinidumpModule` whose address range covers `address`.
     pub fn module_at_address(&self, address: u64) -> Option<&MinidumpModule> {
-        self.modules_by_addr.get(address)
+        self.modules_by_addr
+            .get(address)
             .map(|&index| &self.modules[index])
     }
 
     /// Iterate over the modules in arbitrary order.
-    pub fn iter<'a>(&'a self) -> Modules<'a> {
-        Modules {
-            iter: Box::new(self.modules.iter()),
-        }
+    pub fn iter(&self) -> impl Iterator<Item = &MinidumpModule> {
+        self.modules.iter()
     }
 
     /// Iterate over the modules in order by memory address.
-    pub fn by_addr<'a>(&'a self) -> Modules<'a> {
-        Modules {
-            iter: Box::new(
-                self.modules_by_addr
-                    .ranges_values()
-                    .map(move |&(_, index)| &self.modules[index]),
-            ),
-        }
+    pub fn by_addr(&self) -> impl Iterator<Item = &MinidumpModule> {
+        self.modules_by_addr
+            .ranges_values()
+            .map(move |&(_, index)| &self.modules[index])
     }
 
     /// Write a human-readable description of this `MinidumpModuleList` to `f`.
@@ -731,10 +1013,20 @@ impl MinidumpModuleList {
     }
 }
 
+impl Default for MinidumpModuleList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> MinidumpStream<'a> for MinidumpModuleList {
     const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::ModuleListStream;
 
-    fn read(bytes: &'a [u8], all: &'a [u8], endian: scroll::Endian) -> Result<MinidumpModuleList, Error> {
+    fn read(
+        bytes: &'a [u8],
+        all: &'a [u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpModuleList, Error> {
         let mut offset = 0;
         let raw_modules: Vec<md::MINIDUMP_MODULE> = read_stream_list(&mut offset, bytes, endian)?;
         // read auxiliary data for each module
@@ -753,11 +1045,114 @@ impl<'a> MinidumpStream<'a> for MinidumpModuleList {
     }
 }
 
+impl MinidumpUnloadedModuleList {
+    /// Return an empty `MinidumpModuleList`.
+    pub fn new() -> MinidumpUnloadedModuleList {
+        MinidumpUnloadedModuleList {
+            modules: vec![],
+            modules_by_addr: RangeMap::new(),
+        }
+    }
+    /// Create a `MinidumpModuleList` from a list of `MinidumpModule`s.
+    pub fn from_modules(modules: Vec<MinidumpUnloadedModule>) -> MinidumpUnloadedModuleList {
+        let modules_by_addr = modules
+            .iter()
+            .enumerate()
+            .map(|(i, module)| (module.memory_range(), i))
+            .into_rangemap_safe();
+        MinidumpUnloadedModuleList {
+            modules,
+            modules_by_addr,
+        }
+    }
+
+    /// Return a `MinidumpUnloadedModule` whose address range covers `address`.
+    pub fn module_at_address(&self, address: u64) -> Option<&MinidumpUnloadedModule> {
+        self.modules_by_addr
+            .get(address)
+            .map(|&index| &self.modules[index])
+    }
+
+    /// Iterate over the modules in arbitrary order.
+    pub fn iter(&self) -> impl Iterator<Item = &MinidumpUnloadedModule> {
+        self.modules.iter()
+    }
+
+    /// Iterate over the modules in order by memory address.
+    pub fn by_addr(&self) -> impl Iterator<Item = &MinidumpUnloadedModule> {
+        self.modules_by_addr
+            .ranges_values()
+            .map(move |&(_, index)| &self.modules[index])
+    }
+
+    /// Write a human-readable description of this `MinidumpModuleList` to `f`.
+    ///
+    /// This is very verbose, it is the format used by `minidump_dump`.
+    pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
+        write!(
+            f,
+            "MinidumpUnloadedModuleList
+  module_count = {}
+
+",
+            self.modules.len()
+        )?;
+        for (i, module) in self.modules.iter().enumerate() {
+            writeln!(f, "module[{}]", i)?;
+            module.print(f)?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for MinidumpUnloadedModuleList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> MinidumpStream<'a> for MinidumpUnloadedModuleList {
+    const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::UnloadedModuleListStream;
+
+    fn read(
+        bytes: &'a [u8],
+        all: &'a [u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpUnloadedModuleList, Error> {
+        let mut offset = 0;
+        let raw_modules: Vec<md::MINIDUMP_UNLOADED_MODULE> =
+            read_ex_stream_list(&mut offset, bytes, endian)?;
+        // read auxiliary data for each module
+        let mut modules = Vec::with_capacity(raw_modules.len());
+        for raw in raw_modules.into_iter() {
+            if raw.size_of_image == 0
+                || raw.size_of_image as u64 > (u64::max_value() - raw.base_of_image)
+            {
+                // Bad image size.
+                // TODO: just drop this module, keep the rest?
+                return Err(Error::ModuleReadFailure);
+            }
+            modules.push(MinidumpUnloadedModule::read(raw, all, endian)?);
+        }
+        Ok(MinidumpUnloadedModuleList::from_modules(modules))
+    }
+}
+
 impl<'a> MinidumpMemory<'a> {
-    pub fn read(desc: &md::MINIDUMP_MEMORY_DESCRIPTOR, data: &'a [u8]) -> Result<MinidumpMemory<'a>, Error> {
+    pub fn read(
+        desc: &md::MINIDUMP_MEMORY_DESCRIPTOR,
+        data: &'a [u8],
+    ) -> Result<MinidumpMemory<'a>, Error> {
+        if desc.memory.rva == 0 || desc.memory.data_size == 0 {
+            // Windows will sometimes emit null stack RVAs, indicating that
+            // we need to lookup the address in a memory region. It's ok to
+            // emit an error for that here, the thread processing code will
+            // catch it.
+            return Err(Error::MemoryReadFailure);
+        }
         let bytes = location_slice(data, &desc.memory).or(Err(Error::StreamReadFailure))?;
         Ok(MinidumpMemory {
-            desc: desc.clone(),
+            desc: *desc,
             base_address: desc.start_of_memory_range,
             size: desc.memory.data_size as u64,
             bytes,
@@ -769,8 +1164,9 @@ impl<'a> MinidumpMemory<'a> {
     /// Return `None` if the requested address range falls out of the bounds
     /// of this memory region.
     pub fn get_memory_at_address<T>(&self, addr: u64) -> Option<T>
-        where T: TryFromCtx<'a, scroll::Endian, [u8], Error=scroll::Error, Size=usize>,
-              T: SizeWith<scroll::Endian, Units=usize>,
+    where
+        T: TryFromCtx<'a, scroll::Endian, [u8], Error = scroll::Error>,
+        T: SizeWith<scroll::Endian>,
     {
         let in_range = |a: u64| a >= self.base_address && a < (self.base_address + self.size);
         let size = <T>::size_with(&LE);
@@ -796,7 +1192,7 @@ Memory
             self.desc.start_of_memory_range, self.desc.memory.data_size, self.desc.memory.rva,
         )?;
         self.print_contents(f)?;
-        write!(f, "\n")
+        writeln!(f)
     }
 
     /// Write the contents of this `MinidumpMemory` to `f` as a hex string.
@@ -805,7 +1201,7 @@ Memory
         for byte in self.bytes.iter() {
             write!(f, "{:02x}", byte)?;
         }
-        write!(f, "\n")?;
+        writeln!(f)?;
         Ok(())
     }
 
@@ -815,25 +1211,25 @@ Memory
 }
 
 /// An iterator over `MinidumpMemory`s.
-pub struct MemoryRegions<'b, 'a>
-    where 'a: 'b
-{
-    iter: Box<dyn Iterator<Item = &'b MinidumpMemory<'a>> + 'b>,
+#[allow(missing_debug_implementations)]
+pub struct MemoryRegions<'iter, 'data> {
+    iter: Box<dyn Iterator<Item = &'iter MinidumpMemory<'data>> + 'iter>,
 }
 
-impl<'b, 'a> Iterator for MemoryRegions<'b, 'a>
-    where 'a: 'b
+impl<'iter, 'data> Iterator for MemoryRegions<'iter, 'data>
+where
+    'data: 'iter,
 {
-    type Item = &'b MinidumpMemory<'a>;
+    type Item = &'iter MinidumpMemory<'data>;
 
-    fn next(&mut self) -> Option<&'b MinidumpMemory<'a>> {
+    fn next(&mut self) -> Option<&'iter MinidumpMemory<'data>> {
         self.iter.next()
     }
 }
 
-impl<'a> MinidumpMemoryList<'a> {
+impl<'mdmp> MinidumpMemoryList<'mdmp> {
     /// Return an empty `MinidumpMemoryList`.
-    pub fn new() -> MinidumpMemoryList<'a> {
+    pub fn new() -> MinidumpMemoryList<'mdmp> {
         MinidumpMemoryList {
             regions: vec![],
             regions_by_addr: RangeMap::new(),
@@ -841,9 +1237,12 @@ impl<'a> MinidumpMemoryList<'a> {
     }
 
     /// Create a `MinidumpMemoryList` from a list of `MinidumpMemory`s.
-    pub fn from_regions(regions: Vec<MinidumpMemory<'a>>) -> MinidumpMemoryList<'a> {
-        let regions_by_addr = regions.iter().enumerate()
-            .map(|(i, region)| (region.memory_range(), i)).into_rangemap_safe();
+    pub fn from_regions(regions: Vec<MinidumpMemory<'mdmp>>) -> MinidumpMemoryList<'mdmp> {
+        let regions_by_addr = regions
+            .iter()
+            .enumerate()
+            .map(|(i, region)| (region.memory_range(), i))
+            .into_rangemap_safe();
         MinidumpMemoryList {
             regions,
             regions_by_addr,
@@ -851,20 +1250,26 @@ impl<'a> MinidumpMemoryList<'a> {
     }
 
     /// Return a `MinidumpMemory` containing memory at `address`, if one exists.
-    pub fn memory_at_address(&self, address: u64) -> Option<&MinidumpMemory<'a>> {
-        self.regions_by_addr.get(address)
+    pub fn memory_at_address(&self, address: u64) -> Option<&MinidumpMemory<'mdmp>> {
+        self.regions_by_addr
+            .get(address)
             .map(|&index| &self.regions[index])
     }
 
     /// Iterate over the memory regions in the order contained in the minidump.
-    pub fn iter<'b>(&'b self) -> MemoryRegions<'a, 'b> {
+    ///
+    /// The iterator returns items of [MinidumpMemory] as `&'slf MinidumpMemory<'mdmp>`.
+    /// That is the lifetime of the item is bound to the lifetime of the iterator itself
+    /// (`'slf`), while the slice inside [MinidumpMemory] pointing at the memory itself has
+    /// the lifetime of the [Minidump] struct ('mdmp).
+    pub fn iter<'slf>(&'slf self) -> MemoryRegions<'slf, 'mdmp> {
         MemoryRegions {
             iter: Box::new(self.regions.iter()),
         }
     }
 
     /// Iterate over the memory regions in order by memory address.
-    pub fn by_addr<'b>(&'b self) -> MemoryRegions<'a, 'b> {
+    pub fn by_addr<'slf>(&'slf self) -> MemoryRegions<'slf, 'mdmp> {
         MemoryRegions {
             iter: Box::new(
                 self.regions_by_addr
@@ -894,23 +1299,32 @@ impl<'a> MinidumpMemoryList<'a> {
     }
 }
 
+impl<'a> Default for MinidumpMemoryList<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> MinidumpStream<'a> for MinidumpMemoryList<'a> {
     const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::MemoryListStream;
 
-    fn read(bytes: &'a [u8], all: &'a [u8], endian: scroll::Endian) -> Result<MinidumpMemoryList<'a>, Error> {
+    fn read(
+        bytes: &'a [u8],
+        all: &'a [u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpMemoryList<'a>, Error> {
         let mut offset = 0;
-        let descriptors: Vec<md::MINIDUMP_MEMORY_DESCRIPTOR> = read_stream_list(&mut offset, bytes, endian)?;
+        let descriptors: Vec<md::MINIDUMP_MEMORY_DESCRIPTOR> =
+            read_stream_list(&mut offset, bytes, endian)?;
         // read memory contents for each region
         let mut regions = Vec::with_capacity(descriptors.len());
         for raw in descriptors.into_iter() {
-            if raw.memory.data_size == 0
-                || raw.memory.data_size as u64 > (u64::max_value() - raw.start_of_memory_range)
-            {
-                // Bad size.
-                // TODO: just drop this memory, keep the rest?
-                return Err(Error::MemoryReadFailure);
+            if let Ok(memory) = MinidumpMemory::read(&raw, all) {
+                regions.push(memory);
+            } else {
+                // Just skip over corrupt entries and try to limp along.
+                continue;
             }
-            regions.push(MinidumpMemory::read(&raw, all)?);
         }
         Ok(MinidumpMemoryList::from_regions(regions))
     }
@@ -959,7 +1373,7 @@ impl<'a> MinidumpThread<'a> {
         } else {
             writeln!(f, "No stack")?;
         }
-        write!(f, "\n")?;
+        writeln!(f)?;
         Ok(())
     }
 }
@@ -967,7 +1381,11 @@ impl<'a> MinidumpThread<'a> {
 impl<'a> MinidumpStream<'a> for MinidumpThreadList<'a> {
     const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::ThreadListStream;
 
-    fn read(bytes: &'a [u8], all: &'a [u8], endian: scroll::Endian) -> Result<MinidumpThreadList<'a>, Error> {
+    fn read(
+        bytes: &'a [u8],
+        all: &'a [u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpThreadList<'a>, Error> {
         let mut offset = 0;
         let raw_threads: Vec<md::MINIDUMP_THREAD> = read_stream_list(&mut offset, bytes, endian)?;
         let mut threads = Vec::with_capacity(raw_threads.len());
@@ -976,7 +1394,10 @@ impl<'a> MinidumpStream<'a> for MinidumpThreadList<'a> {
             thread_ids.insert(raw.thread_id, threads.len());
             let context_data = location_slice(all, &raw.thread_context)?;
             let context = MinidumpContext::read(context_data, endian).ok();
-            // TODO: check memory region
+
+            // If this fails, it's ok. That probably means the RVA was null
+            // and we need to lookup the stack's memory by address in the
+            // mapped memory regions (minidump-processor will handle this).
             let stack = MinidumpMemory::read(&raw.stack, all).ok();
             threads.push(MinidumpThread {
                 raw,
@@ -985,8 +1406,8 @@ impl<'a> MinidumpStream<'a> for MinidumpThreadList<'a> {
             });
         }
         Ok(MinidumpThreadList {
-            threads: threads,
-            thread_ids: thread_ids,
+            threads,
+            thread_ids,
         })
     }
 }
@@ -994,10 +1415,7 @@ impl<'a> MinidumpStream<'a> for MinidumpThreadList<'a> {
 impl<'a> MinidumpThreadList<'a> {
     /// Get the thread with id `id` from this thread list if it exists.
     pub fn get_thread(&self, id: u32) -> Option<&MinidumpThread<'a>> {
-        match self.thread_ids.get(&id) {
-            None => None,
-            Some(&index) => Some(&self.threads[index]),
-        }
+        self.thread_ids.get(&id).map(|&index| &self.threads[index])
     }
 
     /// Write a human-readable description of this `MinidumpThreadList` to `f`.
@@ -1014,7 +1432,7 @@ impl<'a> MinidumpThreadList<'a> {
         )?;
 
         for (i, thread) in self.threads.iter().enumerate() {
-            write!(f, "thread[{}]\n", i)?;
+            writeln!(f, "thread[{}]", i)?;
             thread.print(f)?;
         }
         Ok(())
@@ -1024,14 +1442,162 @@ impl<'a> MinidumpThreadList<'a> {
 impl<'a> MinidumpStream<'a> for MinidumpSystemInfo {
     const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::SystemInfoStream;
 
-    fn read(bytes: &[u8], _all: &[u8], endian: scroll::Endian) -> Result<MinidumpSystemInfo, Error> {
-        let raw: md::MINIDUMP_SYSTEM_INFO = bytes.pread_with(0, endian).or(Err(Error::StreamReadFailure))?;
+    fn read(
+        bytes: &[u8],
+        _all: &[u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpSystemInfo, Error> {
+        use std::fmt::Write;
+
+        let raw: md::MINIDUMP_SYSTEM_INFO = bytes
+            .pread_with(0, endian)
+            .or(Err(Error::StreamReadFailure))?;
         let os = Os::from_platform_id(raw.platform_id);
         let cpu = Cpu::from_processor_architecture(raw.processor_architecture);
+
+        let mut csd_offset = raw.csd_version_rva as usize;
+        let csd_version = read_string_utf16(&mut csd_offset, bytes, endian).ok();
+
+        // self.raw.cpu.data is actually a union which we resolve here.
+        let cpu_info = match cpu {
+            Cpu::X86 | Cpu::X86_64 => {
+                let mut cpu_info = String::new();
+
+                if let Cpu::X86 = cpu {
+                    // The vendor's ID is an ascii string but we need to flatten out the u32's into u8's
+                    let x86_info: md::X86CpuInfo = raw
+                        .cpu
+                        .data
+                        .pread_with(0, endian)
+                        .or(Err(Error::StreamReadFailure))?;
+
+                    cpu_info.extend(
+                        x86_info
+                            .vendor_id
+                            .iter()
+                            .flat_map(|i| std::array::IntoIter::new(i.to_le_bytes()))
+                            .map(char::from),
+                    );
+                    cpu_info.push(' ');
+                }
+
+                write!(
+                    &mut cpu_info,
+                    "family {} model {} stepping {}",
+                    raw.processor_level,
+                    (raw.processor_revision >> 8) & 0xff,
+                    raw.processor_revision & 0xff
+                )
+                .unwrap();
+
+                Some(cpu_info)
+            }
+            Cpu::Arm => {
+                let arm_info: md::ARMCpuInfo = raw
+                    .cpu
+                    .data
+                    .pread_with(0, endian)
+                    .or(Err(Error::StreamReadFailure))?;
+
+                // There is no good list of implementer id values, but the following
+                // pages provide some help:
+                //   http://comments.gmane.org/gmane.linux.linaro.devel/6903
+                //   http://forum.xda-developers.com/archive/index.php/t-480226.html
+                let vendors = [
+                    (0x41, "ARM"),
+                    (0x51, "Qualcomm"),
+                    (0x56, "Marvell"),
+                    (0x69, "Intel/Marvell"),
+                ];
+                let parts = [
+                    (0x4100c050, "Cortex-A5"),
+                    (0x4100c080, "Cortex-A8"),
+                    (0x4100c090, "Cortex-A9"),
+                    (0x4100c0f0, "Cortex-A15"),
+                    (0x4100c140, "Cortex-R4"),
+                    (0x4100c150, "Cortex-R5"),
+                    (0x4100b360, "ARM1136"),
+                    (0x4100b560, "ARM1156"),
+                    (0x4100b760, "ARM1176"),
+                    (0x4100b020, "ARM11-MPCore"),
+                    (0x41009260, "ARM926"),
+                    (0x41009460, "ARM946"),
+                    (0x41009660, "ARM966"),
+                    (0x510006f0, "Krait"),
+                    (0x510000f0, "Scorpion"),
+                ];
+                let features = [
+                    (md::ArmElfHwCaps::HWCAP_SWP, "swp"),
+                    (md::ArmElfHwCaps::HWCAP_HALF, "half"),
+                    (md::ArmElfHwCaps::HWCAP_THUMB, "thumb"),
+                    (md::ArmElfHwCaps::HWCAP_26BIT, "26bit"),
+                    (md::ArmElfHwCaps::HWCAP_FAST_MULT, "fastmult"),
+                    (md::ArmElfHwCaps::HWCAP_FPA, "fpa"),
+                    (md::ArmElfHwCaps::HWCAP_VFP, "vfpv2"),
+                    (md::ArmElfHwCaps::HWCAP_EDSP, "edsp"),
+                    (md::ArmElfHwCaps::HWCAP_JAVA, "java"),
+                    (md::ArmElfHwCaps::HWCAP_IWMMXT, "iwmmxt"),
+                    (md::ArmElfHwCaps::HWCAP_CRUNCH, "crunch"),
+                    (md::ArmElfHwCaps::HWCAP_THUMBEE, "thumbee"),
+                    (md::ArmElfHwCaps::HWCAP_NEON, "neon"),
+                    (md::ArmElfHwCaps::HWCAP_VFPv3, "vfpv3"),
+                    (md::ArmElfHwCaps::HWCAP_VFPv3D16, "vfpv3d16"),
+                    (md::ArmElfHwCaps::HWCAP_TLS, "tls"),
+                    (md::ArmElfHwCaps::HWCAP_VFPv4, "vfpv4"),
+                    (md::ArmElfHwCaps::HWCAP_IDIVA, "idiva"),
+                    (md::ArmElfHwCaps::HWCAP_IDIVT, "idivt"),
+                ];
+
+                let mut cpu_info = format!("ARMv{}", raw.processor_level);
+
+                // Try to extract out known vendor/part names from the cpuid,
+                // falling back to just reporting the raw value.
+                let cpuid = arm_info.cpuid;
+                if cpuid != 0 {
+                    let vendor_id = (cpuid >> 24) & 0xff;
+                    let part_id = cpuid & 0xff00fff0;
+
+                    if let Some(&(_, vendor)) = vendors.iter().find(|&&(id, _)| id == vendor_id) {
+                        write!(&mut cpu_info, " {}", vendor).unwrap();
+                    } else {
+                        write!(&mut cpu_info, " vendor(0x{:x})", vendor_id).unwrap();
+                    }
+
+                    if let Some(&(_, part)) = parts.iter().find(|&&(id, _)| id == part_id) {
+                        write!(&mut cpu_info, " {}", part).unwrap();
+                    } else {
+                        write!(&mut cpu_info, " part(0x{:x})", part_id).unwrap();
+                    }
+                }
+
+                // Report all the known hardware features.
+                let elf_hwcaps = md::ArmElfHwCaps::from_bits_truncate(arm_info.elf_hwcaps);
+                if !elf_hwcaps.is_empty() {
+                    cpu_info.push_str(" features: ");
+
+                    // Iterator::intersperse is still unstable, so do it manually
+                    let mut comma = "";
+                    for &(_, feature) in features
+                        .iter()
+                        .filter(|&&(feature, _)| elf_hwcaps.contains(feature))
+                    {
+                        cpu_info.push_str(comma);
+                        cpu_info.push_str(feature);
+                        comma = ",";
+                    }
+                }
+
+                Some(cpu_info)
+            }
+            _ => None,
+        };
+
         Ok(MinidumpSystemInfo {
             raw,
             os,
             cpu,
+            csd_version,
+            cpu_info,
         })
     }
 }
@@ -1055,6 +1621,8 @@ impl MinidumpSystemInfo {
   platform_id                                = {:#x}
   csd_version_rva                            = {:#x}
   suite_mask                                 = {:#x}
+  (version)                                  = {}{}{} {}
+  (cpu_info)                                 = {}
 
 ",
             self.raw.processor_architecture,
@@ -1067,51 +1635,141 @@ impl MinidumpSystemInfo {
             self.raw.build_number,
             self.raw.platform_id,
             self.raw.csd_version_rva,
-            self.raw.suite_mask
+            self.raw.suite_mask,
+            self.raw.major_version,
+            self.raw.minor_version,
+            self.raw.build_number,
+            self.csd_version().as_deref().unwrap_or(""),
+            self.cpu_info().as_deref().unwrap_or(""),
         )?;
         // TODO: cpu info etc
         Ok(())
     }
+
+    pub fn csd_version(&self) -> Option<Cow<str>> {
+        self.csd_version.as_deref().map(Cow::Borrowed)
+    }
+
+    /// Returns a string describing the cpu's vendor and model.
+    pub fn cpu_info(&self) -> Option<Cow<str>> {
+        self.cpu_info.as_deref().map(Cow::Borrowed)
+    }
 }
 
+// Generates an accessor for a MISC_INFO field with two possible syntaxes:
+//
+// * VERSION_NUMBER: FIELD_NAME -> FIELD_TYPE
+// * VERSION_NUMBER: FIELD_NAME if FLAG -> FIELD_TYPE
+//
+// With the following definitions:
+//
+// * VERSION_NUMBER: The MISC_INFO version this field was introduced in
+// * FIELD_NAME: The name of the field to read
+// * FLAG: A MiscInfoFlag that defines if this field contains valid data
+// * FIELD_TYPE: The type of the field
 macro_rules! misc_accessors {
     () => {};
     (@defnoflag $name:ident $t:ty [$($variant:ident)+]) => {
-        pub fn $name(&self) -> $t {
+        #[allow(unreachable_patterns)]
+        pub fn $name(&self) -> Option<&$t> {
             match self {
                 $(
-                    RawMiscInfo::$variant(ref raw) => raw.$name,
+                    RawMiscInfo::$variant(ref raw) => Some(&raw.$name),
                 )+
+                _ => None,
             }
         }
     };
     (@def $name:ident $flag:ident $t:ty [$($variant:ident)+]) => {
-        pub fn $name(&self) -> Option<$t> {
+        #[allow(unreachable_patterns)]
+        pub fn $name(&self) -> Option<&$t> {
             match self {
                 $(
-                    RawMiscInfo::$variant(ref raw) => if md::MiscInfoFlags::from_bits_truncate(raw.flags1).contains(md::MiscInfoFlags::$flag) { Some(raw.$name) } else { None },
+                    RawMiscInfo::$variant(ref raw) => if md::MiscInfoFlags::from_bits_truncate(raw.flags1).contains(md::MiscInfoFlags::$flag) { Some(&raw.$name) } else { None },
                 )+
+                _ => None,
             }
         }
     };
     (1: $name:ident -> $t:ty, $($rest:tt)*) => {
-        misc_accessors!(@defnoflag $name $t [MiscInfo MiscInfo2 MiscInfo3 MiscInfo4]);
+        misc_accessors!(@defnoflag $name $t [MiscInfo MiscInfo2 MiscInfo3 MiscInfo4 MiscInfo5]);
         misc_accessors!($($rest)*);
     };
     (1: $name:ident if $flag:ident -> $t:ty, $($rest:tt)*) => {
-        misc_accessors!(@def $name $flag $t [MiscInfo MiscInfo2 MiscInfo3 MiscInfo4]);
+        misc_accessors!(@def $name $flag $t [MiscInfo MiscInfo2 MiscInfo3 MiscInfo4 MiscInfo5]);
+        misc_accessors!($($rest)*);
+    };
+
+    (2: $name:ident -> $t:ty, $($rest:tt)*) => {
+        misc_accessors!(@defnoflag $name $t [MiscInfo2 MiscInfo3 MiscInfo4 MiscInfo5]);
+        misc_accessors!($($rest)*);
+    };
+    (2: $name:ident if $flag:ident -> $t:ty, $($rest:tt)*) => {
+        misc_accessors!(@def $name $flag $t [MiscInfo2 MiscInfo3 MiscInfo4 MiscInfo5]);
+        misc_accessors!($($rest)*);
+    };
+
+    (3: $name:ident -> $t:ty, $($rest:tt)*) => {
+        misc_accessors!(@defnoflag $name $t [MiscInfo3 MiscInfo4 MiscInfo5]);
+        misc_accessors!($($rest)*);
+    };
+    (3: $name:ident if $flag:ident -> $t:ty, $($rest:tt)*) => {
+        misc_accessors!(@def $name $flag $t [MiscInfo3 MiscInfo4 MiscInfo5]);
+        misc_accessors!($($rest)*);
+    };
+
+    (4: $name:ident -> $t:ty, $($rest:tt)*) => {
+        misc_accessors!(@defnoflag $name $t [MiscInfo4 MiscInfo5]);
+        misc_accessors!($($rest)*);
+    };
+    (4: $name:ident if $flag:ident -> $t:ty, $($rest:tt)*) => {
+        misc_accessors!(@def $name $flag $t [MiscInfo4 MiscInfo5]);
+        misc_accessors!($($rest)*);
+    };
+
+    (5: $name:ident -> $t:ty, $($rest:tt)*) => {
+        misc_accessors!(@defnoflag $name $t [MiscInfo5]);
+        misc_accessors!($($rest)*);
+    };
+    (5: $name:ident if $flag:ident -> $t:ty, $($rest:tt)*) => {
+        misc_accessors!(@def $name $flag $t [MiscInfo5]);
         misc_accessors!($($rest)*);
     };
 }
 
 impl RawMiscInfo {
+    // Fields are grouped by the flag that guards them.
     misc_accessors!(
         1: size_of_info -> u32,
         1: flags1 -> u32,
+
         1: process_id if MINIDUMP_MISC1_PROCESS_ID -> u32,
+
         1: process_create_time if MINIDUMP_MISC1_PROCESS_TIMES -> u32,
         1: process_user_time if MINIDUMP_MISC1_PROCESS_TIMES -> u32,
         1: process_kernel_time if MINIDUMP_MISC1_PROCESS_TIMES -> u32,
+
+        2: processor_max_mhz if MINIDUMP_MISC1_PROCESSOR_POWER_INFO -> u32,
+        2: processor_current_mhz if MINIDUMP_MISC1_PROCESSOR_POWER_INFO -> u32,
+        2: processor_mhz_limit if MINIDUMP_MISC1_PROCESSOR_POWER_INFO -> u32,
+        2: processor_max_idle_state if MINIDUMP_MISC1_PROCESSOR_POWER_INFO -> u32,
+        2: processor_current_idle_state if MINIDUMP_MISC1_PROCESSOR_POWER_INFO -> u32,
+
+        3: process_integrity_level if MINIDUMP_MISC3_PROCESS_INTEGRITY -> u32,
+
+        3: process_execute_flags if MINIDUMP_MISC3_PROCESS_EXECUTE_FLAGS -> u32,
+
+        3: protected_process if MINIDUMP_MISC3_PROTECTED_PROCESS -> u32,
+
+        3: time_zone_id if MINIDUMP_MISC3_TIMEZONE -> u32,
+        3: time_zone if MINIDUMP_MISC3_TIMEZONE -> md::TIME_ZONE_INFORMATION,
+
+        4: build_string if MINIDUMP_MISC4_BUILDSTRING -> [u16; 260],
+        4: dbg_bld_str if MINIDUMP_MISC4_BUILDSTRING -> [u16; 40],
+
+        5: xstate_data -> md::XSTATE_CONFIG_FEATURE_MSC_INFO,
+
+        5: process_cookie if MINIDUMP_MISC5_PROCESS_COOKIE -> u32,
     );
 }
 
@@ -1133,10 +1791,12 @@ impl<'a> MinidumpStream<'a> for MinidumpMiscInfo {
             }
         }
 
-        do_read!((md::MINIDUMP_MISC_INFO4, MiscInfo4),
-                 (md::MINIDUMP_MISC_INFO3, MiscInfo3),
-                 (md::MINIDUMP_MISC_INFO2, MiscInfo2),
-                 (md::MINIDUMP_MISC_INFO, MiscInfo),
+        do_read!(
+            (md::MINIDUMP_MISC_INFO_5, MiscInfo5),
+            (md::MINIDUMP_MISC_INFO_4, MiscInfo4),
+            (md::MINIDUMP_MISC_INFO_3, MiscInfo3),
+            (md::MINIDUMP_MISC_INFO_2, MiscInfo2),
+            (md::MINIDUMP_MISC_INFO, MiscInfo),
         );
         Err(Error::StreamReadFailure)
     }
@@ -1144,28 +1804,37 @@ impl<'a> MinidumpStream<'a> for MinidumpMiscInfo {
 
 impl MinidumpMiscInfo {
     pub fn process_create_time(&self) -> Option<DateTime<Utc>> {
-        self.raw.process_create_time().map(|t| Utc.timestamp(t as i64, 0))
+        self.raw
+            .process_create_time()
+            .map(|t| Utc.timestamp(*t as i64, 0))
     }
 
     /// Write a human-readable description of this `MinidumpMiscInfo` to `f`.
     ///
     /// This is very verbose, it is the format used by `minidump_dump`.
     pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
-        write!(
-            f,
-            "MINIDUMP_MISC_INFO
-  size_of_info                 = {}
-  flags1                       = {:#x}
-  process_id                   = ",
-            self.raw.size_of_info(), self.raw.flags1()
-        )?;
-        match self.raw.process_id() {
-            Some(process_id) => writeln!(f, "{}", process_id)?,
-            None => writeln!(f, "(invalid)")?,
+        macro_rules! write_simple_field {
+            ($stream:ident, $field:ident, $format:literal) => {
+                write!(f, "  {:29}= ", stringify!($field))?;
+                match self.raw.$field() {
+                    Some($field) => {
+                        writeln!(f, $format, $field)?;
+                    }
+                    None => writeln!(f, "(invalid)")?,
+                }
+            };
+            ($stream:ident, $field:ident) => {
+                write_simple_field!($stream, $field, "{}");
+            };
         }
+        writeln!(f, "MINIDUMP_MISC_INFO")?;
+
+        write_simple_field!(f, size_of_info);
+        write_simple_field!(f, flags1, "{:x}");
+        write_simple_field!(f, process_id);
         write!(f, "  process_create_time          = ")?;
         match self.raw.process_create_time() {
-            Some(process_create_time) => {
+            Some(&process_create_time) => {
                 writeln!(
                     f,
                     "{:#x} {}",
@@ -1175,22 +1844,91 @@ impl MinidumpMiscInfo {
             }
             None => writeln!(f, "(invalid)")?,
         }
-        write!(f, "  process_user_time            = ")?;
-        match self.raw.process_user_time() {
-            Some(process_user_time) => {
-                writeln!(f, "{}", process_user_time)?;
+        write_simple_field!(f, process_user_time);
+        write_simple_field!(f, process_kernel_time);
+
+        write_simple_field!(f, processor_max_mhz);
+        write_simple_field!(f, processor_current_mhz);
+        write_simple_field!(f, processor_mhz_limit);
+        write_simple_field!(f, processor_max_idle_state);
+        write_simple_field!(f, processor_current_idle_state);
+
+        write_simple_field!(f, process_integrity_level);
+        write_simple_field!(f, process_execute_flags, "{:x}");
+        write_simple_field!(f, protected_process);
+        write_simple_field!(f, time_zone_id);
+
+        write!(f, "  time_zone                    = ")?;
+        match self.raw.time_zone() {
+            Some(time_zone) => {
+                writeln!(f)?;
+                writeln!(f, "    bias          = {}", time_zone.bias)?;
+                writeln!(
+                    f,
+                    "    standard_name = {}",
+                    utf16_to_string(&time_zone.standard_name[..])
+                        .unwrap_or_else(|| String::from("(invalid)"))
+                )?;
+                writeln!(
+                    f,
+                    "    standard_date = {}",
+                    format_system_time(&time_zone.standard_date)
+                )?;
+                writeln!(f, "    standard_bias = {}", time_zone.standard_bias)?;
+                writeln!(
+                    f,
+                    "    daylight_name = {}",
+                    utf16_to_string(&time_zone.daylight_name[..])
+                        .unwrap_or_else(|| String::from("(invalid)"))
+                )?;
+                writeln!(
+                    f,
+                    "    daylight_date = {}",
+                    format_system_time(&time_zone.daylight_date)
+                )?;
+                writeln!(f, "    daylight_bias = {}", time_zone.daylight_bias)?;
             }
             None => writeln!(f, "(invalid)")?,
         }
-        write!(f, "  process_kernel_time          = ")?;
-        match self.raw.process_kernel_time() {
-            Some(process_kernel_time) => {
-                writeln!(f, "{}", process_kernel_time)?;
+
+        write!(f, "  build_string                 = ")?;
+        match self
+            .raw
+            .build_string()
+            .and_then(|string| utf16_to_string(&string[..]))
+        {
+            Some(build_string) => writeln!(f, "{}", build_string)?,
+            None => writeln!(f, "(invalid)")?,
+        }
+        write!(f, "  dbg_bld_str                  = ")?;
+        match self
+            .raw
+            .dbg_bld_str()
+            .and_then(|string| utf16_to_string(&string[..]))
+        {
+            Some(dbg_bld_str) => writeln!(f, "{}", dbg_bld_str)?,
+            None => writeln!(f, "(invalid)")?,
+        }
+
+        write!(f, "  xstate_data                  = ")?;
+        match self.raw.xstate_data() {
+            Some(xstate_data) => {
+                writeln!(f)?;
+                for (i, feature) in xstate_data.iter() {
+                    if let Some(feature) = md::XstateFeatureIndex::from_index(i) {
+                        write!(f, "    feature {:2} - {:22}: ", i, format!("{:?}", feature))?;
+                    } else {
+                        write!(f, "    feature {:2} - (unknown)           : ", i)?;
+                    }
+                    writeln!(f, " offset {:4}, size {:4}", feature.offset, feature.size)?;
+                    // TODO: load the XSAVE state and print it?
+                }
             }
             None => writeln!(f, "(invalid)")?,
         }
-        // TODO: version 2-4 fields
-        writeln!(f, "")?;
+
+        write_simple_field!(f, process_cookie);
+        writeln!(f)?;
         Ok(())
     }
 }
@@ -1198,8 +1936,14 @@ impl MinidumpMiscInfo {
 impl<'a> MinidumpStream<'a> for MinidumpBreakpadInfo {
     const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::BreakpadInfoStream;
 
-    fn read(bytes: &[u8], _all: &[u8], endian: scroll::Endian) -> Result<MinidumpBreakpadInfo, Error> {
-        let raw: md::MINIDUMP_BREAKPAD_INFO = bytes.pread_with(0, endian).or(Err(Error::StreamReadFailure))?;
+    fn read(
+        bytes: &[u8],
+        _all: &[u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpBreakpadInfo, Error> {
+        let raw: md::MINIDUMP_BREAKPAD_INFO = bytes
+            .pread_with(0, endian)
+            .or(Err(Error::StreamReadFailure))?;
         let flags = md::BreakpadInfoValid::from_bits_truncate(raw.validity);
         let dump_thread_id = if flags.contains(md::BreakpadInfoValid::DumpThreadId) {
             Some(raw.dump_thread_id)
@@ -1219,7 +1963,7 @@ impl<'a> MinidumpStream<'a> for MinidumpBreakpadInfo {
     }
 }
 
-fn option_or_invalid<T: fmt::LowerHex>(what: &Option<T>) -> Cow<str> {
+fn option_or_invalid<T: fmt::LowerHex>(what: &Option<T>) -> Cow<'_, str> {
     match *what {
         Some(ref val) => Cow::Owned(format!("{:#x}", val)),
         None => Cow::Borrowed("(invalid)"),
@@ -1262,7 +2006,7 @@ impl fmt::Display for CrashReason {
     /// For example, "EXCEPTION_ACCESS_VIOLATION" (Windows),
     /// "EXC_BAD_ACCESS / KERN_INVALID_ADDRESS" (Mac OS X), "SIGSEGV"
     /// (other Unix).
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}",
@@ -1276,8 +2020,14 @@ impl fmt::Display for CrashReason {
 impl<'a> MinidumpStream<'a> for MinidumpException {
     const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::ExceptionStream;
 
-    fn read(bytes: &'a [u8], all: &'a [u8], endian: scroll::Endian) -> Result<MinidumpException, Error> {
-        let raw: md::MINIDUMP_EXCEPTION_STREAM = bytes.pread_with(0, endian).or(Err(Error::StreamReadFailure))?;
+    fn read(
+        bytes: &'a [u8],
+        all: &'a [u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpException, Error> {
+        let raw: md::MINIDUMP_EXCEPTION_STREAM = bytes
+            .pread_with(0, endian)
+            .or(Err(Error::StreamReadFailure))?;
         let context_data = location_slice(all, &raw.thread_context)?;
         let context = MinidumpContext::read(context_data, endian).ok();
         let thread_id = raw.thread_id;
@@ -1292,9 +2042,16 @@ impl<'a> MinidumpStream<'a> for MinidumpException {
 impl MinidumpException {
     /// Get the crash address for an exception.
     pub fn get_crash_address(&self, os: Os) -> u64 {
-        match (os, md::ExceptionCodeWindows::from_u32(self.raw.exception_record.exception_code)) {
-            (Os::Windows, Some(md::ExceptionCodeWindows::EXCEPTION_ACCESS_VIOLATION)) |
-            (Os::Windows, Some(md::ExceptionCodeWindows::EXCEPTION_IN_PAGE_ERROR)) if self.raw.exception_record.number_parameters >= 2 => self.raw.exception_record.exception_information[1],
+        match (
+            os,
+            md::ExceptionCodeWindows::from_u32(self.raw.exception_record.exception_code),
+        ) {
+            (Os::Windows, Some(md::ExceptionCodeWindows::EXCEPTION_ACCESS_VIOLATION))
+            | (Os::Windows, Some(md::ExceptionCodeWindows::EXCEPTION_IN_PAGE_ERROR))
+                if self.raw.exception_record.number_parameters >= 2 =>
+            {
+                self.raw.exception_record.exception_information[1]
+            }
             _ => self.raw.exception_record.exception_address,
         }
     }
@@ -1302,6 +2059,10 @@ impl MinidumpException {
     /// Get the crash reason for an exception.
     pub fn get_crash_reason(&self, os: Os) -> CrashReason {
         CrashReason::from_exception(&self.raw, os)
+    }
+
+    pub fn get_crashing_thread_id(&self) -> u32 {
+        self.thread_id
     }
 
     /// Write a human-readable description of this `MinidumpException` to `f`.
@@ -1340,7 +2101,7 @@ impl MinidumpException {
             self.raw.thread_context.data_size, self.raw.thread_context.rva
         )?;
         if let Some(ref context) = self.context {
-            writeln!(f, "")?;
+            writeln!(f)?;
             context.print(f)?;
         } else {
             write!(
@@ -1357,8 +2118,13 @@ impl MinidumpException {
 impl<'a> MinidumpStream<'a> for MinidumpAssertion {
     const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::AssertionInfoStream;
 
-    fn read(bytes: &'a [u8], _all: &'a [u8], endian: scroll::Endian) -> Result<MinidumpAssertion, Error> {
-        let raw: md::MINIDUMP_ASSERTION_INFO = bytes.pread_with(0, endian)
+    fn read(
+        bytes: &'a [u8],
+        _all: &'a [u8],
+        endian: scroll::Endian,
+    ) -> Result<MinidumpAssertion, Error> {
+        let raw: md::MINIDUMP_ASSERTION_INFO = bytes
+            .pread_with(0, endian)
             .or(Err(Error::StreamReadFailure))?;
         Ok(MinidumpAssertion { raw })
     }
@@ -1391,7 +2157,9 @@ impl MinidumpAssertion {
     ///
     /// This is very verbose, it is the format used by `minidump_dump`.
     pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
-        write!(f, "MDAssertion
+        write!(
+            f,
+            "MDAssertion
   expression                                 = {}
   function                                   = {}
   file                                       = {}
@@ -1399,12 +2167,274 @@ impl MinidumpAssertion {
   type                                       = {}
 
 ",
-               self.expression().unwrap_or_else(|| String::new()),
-               self.function().unwrap_or_else(|| String::new()),
-               self.file().unwrap_or_else(|| String::new()),
-               self.raw.line,
-               self.raw._type,
+            self.expression().unwrap_or_else(String::new),
+            self.function().unwrap_or_else(String::new),
+            self.file().unwrap_or_else(String::new),
+            self.raw.line,
+            self.raw._type,
         )?;
+        Ok(())
+    }
+}
+
+fn read_string_list(
+    all: &[u8],
+    location: &md::MINIDUMP_LOCATION_DESCRIPTOR,
+    endian: scroll::Endian,
+) -> Result<Vec<String>, Error> {
+    let data = location_slice(all, location).or(Err(Error::StreamReadFailure))?;
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut offset = 0;
+
+    let count: u32 = data
+        .gread_with(&mut offset, endian)
+        .or(Err(Error::StreamReadFailure))?;
+
+    let mut strings = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let rva: md::RVA = data
+            .gread_with(&mut offset, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        let string = read_string_utf8(&mut (rva as usize), all, endian)
+            .or(Err(Error::StreamReadFailure))?
+            .to_owned();
+
+        strings.push(string);
+    }
+
+    Ok(strings)
+}
+
+fn read_simple_string_dictionary(
+    all: &[u8],
+    location: &md::MINIDUMP_LOCATION_DESCRIPTOR,
+    endian: scroll::Endian,
+) -> Result<BTreeMap<String, String>, Error> {
+    let mut dictionary = BTreeMap::new();
+
+    let data = location_slice(all, location).or(Err(Error::StreamReadFailure))?;
+    if data.is_empty() {
+        return Ok(dictionary);
+    }
+
+    let mut offset = 0;
+
+    let count: u32 = data
+        .gread_with(&mut offset, endian)
+        .or(Err(Error::StreamReadFailure))?;
+
+    for _ in 0..count {
+        let entry: md::MINIDUMP_SIMPLE_STRING_DICTIONARY_ENTRY = data
+            .gread_with(&mut offset, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        let key = read_string_utf8(&mut (entry.key as usize), all, endian)
+            .or(Err(Error::StreamReadFailure))?;
+        let value = read_string_utf8(&mut (entry.value as usize), all, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        dictionary.insert(key.to_owned(), value.to_owned());
+    }
+
+    Ok(dictionary)
+}
+
+fn read_annotation_objects(
+    all: &[u8],
+    location: &md::MINIDUMP_LOCATION_DESCRIPTOR,
+    endian: scroll::Endian,
+) -> Result<BTreeMap<String, MinidumpAnnotation>, Error> {
+    let mut dictionary = BTreeMap::new();
+
+    let data = location_slice(all, location).or(Err(Error::StreamReadFailure))?;
+    if data.is_empty() {
+        return Ok(dictionary);
+    }
+
+    let mut offset = 0;
+
+    let count: u32 = data
+        .gread_with(&mut offset, endian)
+        .or(Err(Error::StreamReadFailure))?;
+
+    for _ in 0..count {
+        let raw: md::MINIDUMP_ANNOTATION = data
+            .gread_with(&mut offset, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        let key = read_string_utf8(&mut (raw.name as usize), all, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        let value = match raw.ty {
+            md::MINIDUMP_ANNOTATION::TYPE_INVALID => MinidumpAnnotation::Invalid,
+            md::MINIDUMP_ANNOTATION::TYPE_STRING => {
+                let string = read_string_utf8_unterminated(&mut (raw.value as usize), all, endian)
+                    .or(Err(Error::StreamReadFailure))?
+                    .to_owned();
+
+                MinidumpAnnotation::String(string)
+            }
+            _ if raw.ty >= md::MINIDUMP_ANNOTATION::TYPE_USER_DEFINED => {
+                MinidumpAnnotation::UserDefined(raw)
+            }
+            _ => MinidumpAnnotation::Unsupported(raw),
+        };
+
+        dictionary.insert(key.to_owned(), value);
+    }
+
+    Ok(dictionary)
+}
+
+impl MinidumpModuleCrashpadInfo {
+    pub fn read(
+        link: md::MINIDUMP_MODULE_CRASHPAD_INFO_LINK,
+        all: &[u8],
+        endian: scroll::Endian,
+    ) -> Result<Self, Error> {
+        let raw: md::MINIDUMP_MODULE_CRASHPAD_INFO = all
+            .pread_with(link.location.rva as usize, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        let list_annotations = read_string_list(all, &raw.list_annotations, endian)?;
+        let simple_annotations =
+            read_simple_string_dictionary(all, &raw.simple_annotations, endian)?;
+        let annotation_objects = read_annotation_objects(all, &raw.annotation_objects, endian)?;
+
+        Ok(Self {
+            raw,
+            module_index: link.minidump_module_list_index as usize,
+            list_annotations,
+            simple_annotations,
+            annotation_objects,
+        })
+    }
+}
+
+fn read_crashpad_module_links(
+    all: &[u8],
+    location: &md::MINIDUMP_LOCATION_DESCRIPTOR,
+    endian: scroll::Endian,
+) -> Result<Vec<MinidumpModuleCrashpadInfo>, Error> {
+    let data = location_slice(all, location).or(Err(Error::StreamReadFailure))?;
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut offset = 0;
+
+    let count: u32 = data
+        .gread_with(&mut offset, endian)
+        .or(Err(Error::StreamReadFailure))?;
+
+    let mut module_links = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let link: md::MINIDUMP_MODULE_CRASHPAD_INFO_LINK = data
+            .gread_with(&mut offset, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        let info = MinidumpModuleCrashpadInfo::read(link, all, endian)?;
+        module_links.push(info);
+    }
+
+    Ok(module_links)
+}
+
+impl<'a> MinidumpStream<'a> for MinidumpCrashpadInfo {
+    const STREAM_TYPE: MINIDUMP_STREAM_TYPE = MINIDUMP_STREAM_TYPE::CrashpadInfoStream;
+
+    fn read(bytes: &'a [u8], all: &'a [u8], endian: scroll::Endian) -> Result<Self, Error> {
+        let raw: md::MINIDUMP_CRASHPAD_INFO = bytes
+            .pread_with(0, endian)
+            .or(Err(Error::StreamReadFailure))?;
+
+        if raw.version == 0 {
+            // 0 is an invalid version, but all future versions are compatible with v1.
+            return Err(Error::VersionMismatch);
+        }
+
+        let simple_annotations =
+            read_simple_string_dictionary(all, &raw.simple_annotations, endian)?;
+
+        let module_list = read_crashpad_module_links(all, &raw.module_list, endian)?;
+
+        Ok(Self {
+            raw,
+            simple_annotations,
+            module_list,
+        })
+    }
+}
+
+impl MinidumpCrashpadInfo {
+    /// Write a human-readable description of this `MinidumpCrashpadInfo` to `f`.
+    ///
+    /// This is very verbose, it is the format used by `minidump_dump`.
+    pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
+        write!(
+            f,
+            "MDRawCrashpadInfo
+  version = {}
+  report_id = {}
+  client_id = {}
+",
+            self.raw.version, self.raw.report_id, self.raw.client_id,
+        )?;
+
+        for (name, value) in &self.simple_annotations {
+            writeln!(f, "  simple_annotations[\"{}\"] = {}", name, value)?;
+        }
+
+        for (index, module) in self.module_list.iter().enumerate() {
+            writeln!(
+                f,
+                "  module_list[{}].minidump_module_list_index = {}",
+                index, module.module_index,
+            )?;
+            writeln!(
+                f,
+                "  module_list[{}].version = {}",
+                index, module.raw.version,
+            )?;
+
+            for (annotation_index, annotation) in module.list_annotations.iter().enumerate() {
+                writeln!(
+                    f,
+                    "  module_list[{}].list_annotations[{}] = {}",
+                    index, annotation_index, annotation,
+                )?;
+            }
+
+            for (name, value) in &module.simple_annotations {
+                writeln!(
+                    f,
+                    "  module_list[{}].simple_annotations[\"{}\"] = {}",
+                    index, name, value,
+                )?;
+            }
+
+            for (name, value) in &module.annotation_objects {
+                write!(
+                    f,
+                    "  module_list[{}].annotation_objects[\"{}\"] = ",
+                    index, name,
+                )?;
+
+                match value {
+                    MinidumpAnnotation::Invalid => writeln!(f, "<invalid>"),
+                    MinidumpAnnotation::String(string) => writeln!(f, "{}", string),
+                    MinidumpAnnotation::UserDefined(_) => writeln!(f, "<user defined>"),
+                    MinidumpAnnotation::Unsupported(_) => writeln!(f, "<unsupported>"),
+                }?;
+            }
+        }
+
+        writeln!(f)?;
+
         Ok(())
     }
 }
@@ -1418,13 +2448,14 @@ impl<'a> Minidump<'a, Mmap> {
         P: AsRef<Path>,
     {
         let f = File::open(path).or(Err(Error::FileNotFound))?;
-        let mmap = unsafe { Mmap::map(&f).or(Err(Error::IOError))?  };
+        let mmap = unsafe { Mmap::map(&f).or(Err(Error::IoError))? };
         Minidump::read(mmap)
     }
 }
 
 impl<'a, T> Minidump<'a, T>
-    where T: Deref<Target=[u8]> + 'a,
+where
+    T: Deref<Target = [u8]> + 'a,
 {
     /// Read a `Minidump` from the provided `data`.
     ///
@@ -1433,7 +2464,8 @@ impl<'a, T> Minidump<'a, T>
     pub fn read(data: T) -> Result<Minidump<'a, T>, Error> {
         let mut offset = 0;
         let mut endian = LE;
-        let mut header: md::MINIDUMP_HEADER = data.gread_with(&mut offset, endian)
+        let mut header: md::MINIDUMP_HEADER = data
+            .gread_with(&mut offset, endian)
             .or(Err(Error::MissingHeader))?;
         if header.signature != md::MINIDUMP_SIGNATURE {
             if header.signature.swap_bytes() != md::MINIDUMP_SIGNATURE {
@@ -1442,7 +2474,8 @@ impl<'a, T> Minidump<'a, T>
             // Try again with big-endian.
             endian = BE;
             offset = 0;
-            header = data.gread_with(&mut offset, endian)
+            header = data
+                .gread_with(&mut offset, endian)
                 .or(Err(Error::MissingHeader))?;
             if header.signature != md::MINIDUMP_SIGNATURE {
                 return Err(Error::HeaderMismatch);
@@ -1454,7 +2487,8 @@ impl<'a, T> Minidump<'a, T>
         let mut streams = HashMap::with_capacity(header.stream_count as usize);
         offset = header.stream_directory_rva as usize;
         for i in 0..header.stream_count {
-            let dir: md::MINIDUMP_DIRECTORY = data.gread_with(&mut offset, endian)
+            let dir: md::MINIDUMP_DIRECTORY = data
+                .gread_with(&mut offset, endian)
                 .or(Err(Error::MissingDirectory))?;
             streams.insert(dir.stream_type, (i, dir));
         }
@@ -1473,10 +2507,14 @@ impl<'a, T> Minidump<'a, T>
     /// [`MinidumpStream`][stream] trait, this method allows reading
     /// the stream data as a specific type.
     ///
+    /// Note that the lifetime of the returned stream is bound to the lifetime of the this
+    /// `Minidump` struct itself and not to the lifetime of the data backing this minidump.
+    /// This is a consequence of how this struct relies on [Deref] to access the data.
+    ///
     /// [stream]: trait.MinidumpStream.html
-    pub fn get_stream<'b, S>(&'b self) -> Result<S, Error>
-        where S: MinidumpStream<'a>,
-             'b: 'a,
+    pub fn get_stream<S>(&'a self) -> Result<S, Error>
+    where
+        S: MinidumpStream<'a>,
     {
         match self.get_raw_stream(S::STREAM_TYPE) {
             Err(e) => Err(e),
@@ -1493,10 +2531,14 @@ impl<'a, T> Minidump<'a, T>
     /// For streams of known types you almost certainly want to use
     /// [`get_stream`][get_stream] instead.
     ///
+    /// Note that the lifetime of the returned stream is bound to the lifetime of the this
+    /// `Minidump` struct itself and not to the lifetime of the data backing this minidump.
+    /// This is a consequence of how this struct relies on [Deref] to access the data.
+    ///
     /// [get_stream]: #get_stream
-    pub fn get_raw_stream<'b, S>(&'b self, stream_type: S) -> Result<&'a [u8], Error>
-        where S: Into<u32>,
-             'b: 'a,
+    pub fn get_raw_stream<S>(&'a self, stream_type: S) -> Result<&'a [u8], Error>
+    where
+        S: Into<u32>,
     {
         match self.streams.get(&stream_type.into()) {
             None => Err(Error::StreamNotFound),
@@ -1557,18 +2599,18 @@ MDRawDirectory
                 stream.location.rva
             )?;
         }
-        write!(f, "Streams:\n")?;
+        writeln!(f, "Streams:")?;
         streams.sort_by(|&(&a, &(_, _)), &(&b, &(_, _))| a.cmp(&b));
         for (_, &(i, ref stream)) in streams {
-            write!(
+            writeln!(
                 f,
-                "  stream type {:#x} ({}) at index {}\n",
+                "  stream type {:#x} ({}) at index {}",
                 stream.stream_type,
                 get_stream_name(stream.stream_type),
                 i
             )?;
         }
-        write!(f, "\n")?;
+        writeln!(f)?;
         Ok(())
     }
 }
@@ -1576,16 +2618,18 @@ MDRawDirectory
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::synth_minidump::{
+        self, AnnotationValue, CrashpadInfo, DumpString, Memory, MiscFieldsBuildString,
+        MiscFieldsPowerInfo, MiscFieldsProcessTimes, MiscFieldsTimeZone, MiscInfo5Fields,
+        MiscStream, Module as SynthModule, ModuleCrashpadInfo, SimpleStream, SynthMinidump, Thread,
+        UnloadedModule as SynthUnloadedModule, STOCK_VERSION_INFO,
+    };
+    use md::GUID;
     use std::mem;
-    use synth_minidump::{self, MiscStream, SimpleStream, SynthMinidump, Thread};
-    use synth_minidump::{DumpString, Memory, STOCK_VERSION_INFO};
-    use synth_minidump::Module as SynthModule;
     use test_assembler::*;
 
     fn read_synth_dump<'a>(dump: SynthMinidump) -> Result<Minidump<'a, Vec<u8>>, Error> {
-        dump.finish()
-            .ok_or(Error::FileNotFound)
-            .and_then(|bytes| Minidump::read(bytes))
+        Minidump::read(dump.finish().unwrap())
     }
 
     #[test]
@@ -1602,7 +2646,10 @@ mod test {
             &[0x88, 0x77, 0x66, 0x55]
         );
 
-        assert_eq!(dump.get_raw_stream(0xaabbccddu32), Err(Error::StreamNotFound));
+        assert_eq!(
+            dump.get_raw_stream(0xaabbccddu32),
+            Err(Error::StreamNotFound)
+        );
     }
 
     #[test]
@@ -1619,14 +2666,17 @@ mod test {
             &[0x55, 0x66, 0x77, 0x88]
         );
 
-        assert_eq!(dump.get_raw_stream(0xaabbccddu32), Err(Error::StreamNotFound));
+        assert_eq!(
+            dump.get_raw_stream(0xaabbccddu32),
+            Err(Error::StreamNotFound)
+        );
     }
 
     #[test]
     fn test_module_list() {
         let name = DumpString::new("single module", Endian::Little);
         let cv_record = Section::with_endian(Endian::Little)
-            .D32(md::CvSignature::Pdb70 as u32)  // signature
+            .D32(md::CvSignature::Pdb70 as u32) // signature
             // signature, a GUID
             .D32(0xabcd1234)
             .D16(0xf00d)
@@ -1642,7 +2692,8 @@ mod test {
             0xb1054d2a,
             0x34571371,
             Some(&STOCK_VERSION_INFO),
-        ).cv_record(&cv_record);
+        )
+        .cv_record(&cv_record);
         let dump = SynthMinidump::with_endian(Endian::Little)
             .add_module(module)
             .add(name)
@@ -1664,6 +2715,31 @@ mod test {
     }
 
     #[test]
+    fn test_unloaded_module_list() {
+        let name = DumpString::new("single module", Endian::Little);
+        let module = SynthUnloadedModule::new(
+            Endian::Little,
+            0xa90206ca83eb2852,
+            0xada542bd,
+            &name,
+            0xb1054d2a,
+            0x34571371,
+        );
+        let dump = SynthMinidump::with_endian(Endian::Little)
+            .add_unloaded_module(module)
+            .add(name);
+        let dump = read_synth_dump(dump).unwrap();
+        let module_list = dump.get_stream::<MinidumpUnloadedModuleList>().unwrap();
+        let modules = module_list.iter().collect::<Vec<_>>();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].base_address(), 0xa90206ca83eb2852);
+        assert_eq!(modules[0].size(), 0xada542bd);
+        assert_eq!(modules[0].code_file(), "single module");
+        // time_date_stamp and size_of_image concatenated
+        assert_eq!(modules[0].code_identifier(), "B1054D2Aada542bd");
+    }
+
+    #[test]
     fn test_module_list_overlap() {
         let name1 = DumpString::new("module 1", Endian::Little);
         let name2 = DumpString::new("module 2", Endian::Little);
@@ -1671,7 +2747,7 @@ mod test {
         let name4 = DumpString::new("module 4", Endian::Little);
         let name5 = DumpString::new("module 5", Endian::Little);
         let cv_record = Section::with_endian(Endian::Little)
-            .D32(md::CvSignature::Pdb70 as u32)  // signature
+            .D32(md::CvSignature::Pdb70 as u32) // signature
             // signature, a GUID
             .D32(0xabcd1234)
             .D16(0xf00d)
@@ -1687,7 +2763,8 @@ mod test {
             0xb1054d2a,
             0x34571371,
             Some(&STOCK_VERSION_INFO),
-        ).cv_record(&cv_record);
+        )
+        .cv_record(&cv_record);
         // module2 overlaps module1 exactly
         let module2 = SynthModule::new(
             Endian::Little,
@@ -1697,7 +2774,8 @@ mod test {
             0xb1054d2a,
             0x34571371,
             Some(&STOCK_VERSION_INFO),
-        ).cv_record(&cv_record);
+        )
+        .cv_record(&cv_record);
         // module3 overlaps module1 partially
         let module3 = SynthModule::new(
             Endian::Little,
@@ -1707,7 +2785,8 @@ mod test {
             0xb1054d2a,
             0x34571371,
             Some(&STOCK_VERSION_INFO),
-        ).cv_record(&cv_record);
+        )
+        .cv_record(&cv_record);
         // module4 is fully contained within module1
         let module4 = SynthModule::new(
             Endian::Little,
@@ -1717,7 +2796,8 @@ mod test {
             0xb1054d2a,
             0x34571371,
             Some(&STOCK_VERSION_INFO),
-        ).cv_record(&cv_record);
+        )
+        .cv_record(&cv_record);
         // module5 is cool, though.
         let module5 = SynthModule::new(
             Endian::Little,
@@ -1727,7 +2807,8 @@ mod test {
             0xb1054d2a,
             0x34571371,
             Some(&STOCK_VERSION_INFO),
-        ).cv_record(&cv_record);
+        )
+        .cv_record(&cv_record);
         let dump = SynthMinidump::with_endian(Endian::Little)
             .add_module(module1)
             .add_module(module2)
@@ -1761,26 +2842,55 @@ mod test {
         assert_eq!(modules[4].code_file(), "module 5");
 
         // module_at_address should discard overlapping modules.
-        assert_eq!(module_list.by_addr().collect::<Vec<_>>().len(), 2);
-        assert_eq!(module_list.module_at_address(0x100001000).unwrap().code_file(), "module 1");
-        assert_eq!(module_list.module_at_address(0x100005000).unwrap().code_file(), "module 5");
+        assert_eq!(module_list.by_addr().count(), 2);
+        assert_eq!(
+            module_list
+                .module_at_address(0x100001000)
+                .unwrap()
+                .code_file(),
+            "module 1"
+        );
+        assert_eq!(
+            module_list
+                .module_at_address(0x100005000)
+                .unwrap()
+                .code_file(),
+            "module 5"
+        );
     }
 
     #[test]
     fn test_memory_list() {
-        const CONTENTS: &'static [u8] = b"memory_contents";
+        const CONTENTS: &[u8] = b"memory_contents";
         let memory = Memory::with_section(
             Section::with_endian(Endian::Little).append_bytes(CONTENTS),
             0x309d68010bd21b2c,
         );
         let dump = SynthMinidump::with_endian(Endian::Little).add_memory(memory);
         let dump = read_synth_dump(dump).unwrap();
-        let memory_list = dump.get_stream::<MinidumpMemoryList>().unwrap();
+        let memory_list = dump.get_stream::<MinidumpMemoryList<'_>>().unwrap();
         let regions = memory_list.iter().collect::<Vec<_>>();
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].base_address, 0x309d68010bd21b2c);
         assert_eq!(regions[0].size, CONTENTS.len() as u64);
         assert_eq!(&regions[0].bytes, &CONTENTS);
+    }
+
+    #[test]
+    fn test_memory_list_lifetimes() {
+        // A memory list should not own any of the minidump data.
+        const CONTENTS: &[u8] = b"memory_contents";
+        let memory = Memory::with_section(
+            Section::with_endian(Endian::Little).append_bytes(CONTENTS),
+            0x309d68010bd21b2c,
+        );
+        let dump = SynthMinidump::with_endian(Endian::Little).add_memory(memory);
+        let dump = read_synth_dump(dump).unwrap();
+        let mem_slices: Vec<&[u8]> = {
+            let mem_list: MinidumpMemoryList<'_> = dump.get_stream().unwrap();
+            mem_list.iter().map(|mem| mem.bytes).collect()
+        };
+        assert_eq!(mem_slices[0], CONTENTS);
     }
 
     #[test]
@@ -1816,7 +2926,7 @@ mod test {
             .add_memory(memory4)
             .add_memory(memory5);
         let dump = read_synth_dump(dump).unwrap();
-        let memory_list = dump.get_stream::<MinidumpMemoryList>().unwrap();
+        let memory_list = dump.get_stream::<MinidumpMemoryList<'_>>().unwrap();
         let regions = memory_list.iter().collect::<Vec<_>>();
         assert_eq!(regions.len(), 5);
         assert_eq!(regions[0].base_address, 0x1000);
@@ -1831,7 +2941,7 @@ mod test {
         assert_eq!(regions[4].size, 0x1000);
 
         // memory_at_address should discard overlapping regions.
-        assert_eq!(memory_list.by_addr().collect::<Vec<_>>().len(), 2);
+        assert_eq!(memory_list.by_addr().count(), 2);
         let m1 = memory_list.memory_at_address(0x1a00).unwrap();
         assert_eq!(m1.base_address, 0x1000);
         assert_eq!(m1.size, 0x1000);
@@ -1845,48 +2955,278 @@ mod test {
     #[test]
     fn test_misc_info() {
         const PID: u32 = 0x1234abcd;
-        const CREATE_TIME: u32 = 0xf0f0b0b0;
+        const PROCESS_TIMES: MiscFieldsProcessTimes = MiscFieldsProcessTimes {
+            process_create_time: 0xf0f0b0b0,
+            process_user_time: 0xf030a020,
+            process_kernel_time: 0xa010b420,
+        };
+
         let mut misc = MiscStream::new(Endian::Little);
         misc.process_id = Some(PID);
-        misc.process_create_time = Some(CREATE_TIME);
+        misc.process_times = Some(PROCESS_TIMES);
         let dump = SynthMinidump::with_endian(Endian::Little).add_stream(misc);
         let dump = read_synth_dump(dump).unwrap();
         let misc = dump.get_stream::<MinidumpMiscInfo>().unwrap();
-        assert_eq!(misc.raw.process_id(), Some(PID));
+        assert_eq!(misc.raw.process_id(), Some(&PID));
         assert_eq!(
             misc.process_create_time().unwrap(),
-            Utc.timestamp(CREATE_TIME as i64, 0)
+            Utc.timestamp(PROCESS_TIMES.process_create_time as i64, 0)
+        );
+        assert_eq!(
+            *misc.raw.process_user_time().unwrap(),
+            PROCESS_TIMES.process_user_time
+        );
+        assert_eq!(
+            *misc.raw.process_kernel_time().unwrap(),
+            PROCESS_TIMES.process_kernel_time
         );
     }
 
     #[test]
     fn test_misc_info_large() {
         const PID: u32 = 0x1234abcd;
-        const CREATE_TIME: u32 = 0xf0f0b0b0;
+        const PROCESS_TIMES: MiscFieldsProcessTimes = MiscFieldsProcessTimes {
+            process_create_time: 0xf0f0b0b0,
+            process_user_time: 0xf030a020,
+            process_kernel_time: 0xa010b420,
+        };
         let mut misc = MiscStream::new(Endian::Little);
         misc.process_id = Some(PID);
-        misc.process_create_time = Some(CREATE_TIME);
+        misc.process_times = Some(PROCESS_TIMES);
         // Make it larger.
         misc.pad_to_size = Some(mem::size_of::<md::MINIDUMP_MISC_INFO>() + 32);
         let dump = SynthMinidump::with_endian(Endian::Little).add_stream(misc);
         let dump = read_synth_dump(dump).unwrap();
         let misc = dump.get_stream::<MinidumpMiscInfo>().unwrap();
-        assert_eq!(misc.raw.process_id(), Some(PID));
+        assert_eq!(misc.raw.process_id(), Some(&PID));
         assert_eq!(
             misc.process_create_time().unwrap(),
-            Utc.timestamp(CREATE_TIME as i64, 0)
+            Utc.timestamp(PROCESS_TIMES.process_create_time as i64, 0)
         );
+        assert_eq!(
+            *misc.raw.process_user_time().unwrap(),
+            PROCESS_TIMES.process_user_time
+        );
+        assert_eq!(
+            *misc.raw.process_kernel_time().unwrap(),
+            PROCESS_TIMES.process_kernel_time
+        );
+    }
+
+    fn ascii_string_to_utf16(input: &str) -> Vec<u16> {
+        input.chars().map(|c| c as u16).collect()
+    }
+
+    #[test]
+    fn test_misc_info_5() {
+        // MISC_INFO fields
+        const PID: u32 = 0x1234abcd;
+        const PROCESS_TIMES: MiscFieldsProcessTimes = MiscFieldsProcessTimes {
+            process_create_time: 0xf0f0b0b0,
+            process_user_time: 0xf030a020,
+            process_kernel_time: 0xa010b420,
+        };
+
+        // MISC_INFO_2 fields
+        const POWER_INFO: MiscFieldsPowerInfo = MiscFieldsPowerInfo {
+            processor_max_mhz: 0x45873234,
+            processor_current_mhz: 0x2134018a,
+            processor_mhz_limit: 0x3423aead,
+            processor_max_idle_state: 0x123aef12,
+            processor_current_idle_state: 0x1205af3a,
+        };
+
+        // MISC_INFO_3 fields
+        const PROCESS_INTEGRITY_LEVEL: u32 = 0x35603403;
+        const PROCESS_EXECUTE_FLAGS: u32 = 0xa4e09da1;
+        const PROTECTED_PROCESS: u32 = 0x12345678;
+
+        let mut standard_name = [0; 32];
+        let mut daylight_name = [0; 32];
+        let bare_standard_name = ascii_string_to_utf16("Pacific Standard Time");
+        let bare_daylight_name = ascii_string_to_utf16("Pacific Daylight Time");
+        standard_name[..bare_standard_name.len()].copy_from_slice(&bare_standard_name);
+        daylight_name[..bare_daylight_name.len()].copy_from_slice(&bare_daylight_name);
+
+        const TIME_ZONE_ID: u32 = 2;
+        const BIAS: i32 = 2;
+        const STANDARD_BIAS: i32 = 1;
+        const DAYLIGHT_BIAS: i32 = -60;
+        const STANDARD_DATE: md::SYSTEMTIME = md::SYSTEMTIME {
+            year: 0,
+            month: 11,
+            day_of_week: 2,
+            day: 1,
+            hour: 2,
+            minute: 33,
+            second: 51,
+            milliseconds: 123,
+        };
+        const DAYLIGHT_DATE: md::SYSTEMTIME = md::SYSTEMTIME {
+            year: 0,
+            month: 3,
+            day_of_week: 4,
+            day: 2,
+            hour: 3,
+            minute: 41,
+            second: 19,
+            milliseconds: 512,
+        };
+
+        let time_zone = MiscFieldsTimeZone {
+            time_zone_id: TIME_ZONE_ID,
+            time_zone: md::TIME_ZONE_INFORMATION {
+                bias: BIAS,
+                standard_bias: STANDARD_BIAS,
+                daylight_bias: DAYLIGHT_BIAS,
+                daylight_name,
+                standard_name,
+                standard_date: STANDARD_DATE.clone(),
+                daylight_date: DAYLIGHT_DATE.clone(),
+            },
+        };
+
+        // MISC_INFO_4 fields
+        let mut build_string = [0; 260];
+        let mut dbg_bld_str = [0; 40];
+        let bare_build_string = ascii_string_to_utf16("hello");
+        let bare_dbg_bld_str = ascii_string_to_utf16("world");
+        build_string[..bare_build_string.len()].copy_from_slice(&bare_build_string);
+        dbg_bld_str[..bare_dbg_bld_str.len()].copy_from_slice(&bare_dbg_bld_str);
+
+        let build_strings = MiscFieldsBuildString {
+            build_string,
+            dbg_bld_str,
+        };
+
+        // MISC_INFO_5 fields
+        const SIZE_OF_INFO: u32 = mem::size_of::<md::XSTATE_CONFIG_FEATURE_MSC_INFO>() as u32;
+        const CONTEXT_SIZE: u32 = 0x1234523f;
+        const PROCESS_COOKIE: u32 = 0x1234dfe0;
+        const KNOWN_FEATURE_IDX: usize = md::XstateFeatureIndex::LEGACY_SSE as usize;
+        const UNKNOWN_FEATURE_IDX: usize = 39;
+        let mut enabled_features = 0;
+        let mut features = [md::XSTATE_FEATURE::default(); 64];
+        // One known feature and one unknown feature.
+        enabled_features |= 1 << KNOWN_FEATURE_IDX;
+        features[KNOWN_FEATURE_IDX] = md::XSTATE_FEATURE {
+            offset: 0,
+            size: 140,
+        };
+        enabled_features |= 1 << UNKNOWN_FEATURE_IDX;
+        features[UNKNOWN_FEATURE_IDX] = md::XSTATE_FEATURE {
+            offset: 320,
+            size: 1100,
+        };
+        let misc_5 = MiscInfo5Fields {
+            xstate_data: md::XSTATE_CONFIG_FEATURE_MSC_INFO {
+                size_of_info: SIZE_OF_INFO,
+                context_size: CONTEXT_SIZE,
+                enabled_features,
+                features,
+            },
+            process_cookie: Some(PROCESS_COOKIE),
+        };
+
+        let mut misc = MiscStream::new(Endian::Little);
+        misc.process_id = Some(PID);
+        misc.process_times = Some(PROCESS_TIMES);
+        misc.power_info = Some(POWER_INFO);
+        misc.process_integrity_level = Some(PROCESS_INTEGRITY_LEVEL);
+        misc.protected_process = Some(PROTECTED_PROCESS);
+        misc.process_execute_flags = Some(PROCESS_EXECUTE_FLAGS);
+        misc.time_zone = Some(time_zone);
+        misc.build_strings = Some(build_strings);
+        misc.misc_5 = Some(misc_5);
+
+        let dump = SynthMinidump::with_endian(Endian::Little).add_stream(misc);
+        let dump = read_synth_dump(dump).unwrap();
+        let misc = dump.get_stream::<MinidumpMiscInfo>().unwrap();
+
+        // MISC_INFO fields
+        assert_eq!(misc.raw.process_id(), Some(&PID));
+        assert_eq!(
+            misc.process_create_time().unwrap(),
+            Utc.timestamp(PROCESS_TIMES.process_create_time as i64, 0)
+        );
+        assert_eq!(
+            *misc.raw.process_user_time().unwrap(),
+            PROCESS_TIMES.process_user_time
+        );
+        assert_eq!(
+            *misc.raw.process_kernel_time().unwrap(),
+            PROCESS_TIMES.process_kernel_time
+        );
+
+        // MISC_INFO_2 fields
+        assert_eq!(
+            *misc.raw.processor_max_mhz().unwrap(),
+            POWER_INFO.processor_max_mhz,
+        );
+        assert_eq!(
+            *misc.raw.processor_current_mhz().unwrap(),
+            POWER_INFO.processor_current_mhz,
+        );
+        assert_eq!(
+            *misc.raw.processor_mhz_limit().unwrap(),
+            POWER_INFO.processor_mhz_limit,
+        );
+        assert_eq!(
+            *misc.raw.processor_max_idle_state().unwrap(),
+            POWER_INFO.processor_max_idle_state,
+        );
+        assert_eq!(
+            *misc.raw.processor_current_idle_state().unwrap(),
+            POWER_INFO.processor_current_idle_state,
+        );
+
+        // MISC_INFO_3 fields
+        assert_eq!(*misc.raw.time_zone_id().unwrap(), TIME_ZONE_ID);
+        let time_zone = misc.raw.time_zone().unwrap();
+        assert_eq!(time_zone.bias, BIAS);
+        assert_eq!(time_zone.standard_bias, STANDARD_BIAS);
+        assert_eq!(time_zone.daylight_bias, DAYLIGHT_BIAS);
+        assert_eq!(time_zone.standard_date, STANDARD_DATE);
+        assert_eq!(time_zone.daylight_date, DAYLIGHT_DATE);
+        assert_eq!(time_zone.standard_name, standard_name);
+        assert_eq!(time_zone.daylight_name, daylight_name);
+
+        // MISC_INFO_4 fields
+        assert_eq!(*misc.raw.build_string().unwrap(), build_string,);
+        assert_eq!(*misc.raw.dbg_bld_str().unwrap(), dbg_bld_str,);
+
+        // MISC_INFO_5 fields
+        assert_eq!(*misc.raw.process_cookie().unwrap(), PROCESS_COOKIE,);
+
+        let xstate = misc.raw.xstate_data().unwrap();
+        assert_eq!(xstate.size_of_info, SIZE_OF_INFO);
+        assert_eq!(xstate.context_size, CONTEXT_SIZE);
+        assert_eq!(xstate.enabled_features, enabled_features);
+        assert_eq!(xstate.features, features);
+
+        let mut xstate_iter = xstate.iter();
+        assert_eq!(
+            xstate_iter.next().unwrap(),
+            (KNOWN_FEATURE_IDX, features[KNOWN_FEATURE_IDX]),
+        );
+        assert_eq!(
+            xstate_iter.next().unwrap(),
+            (UNKNOWN_FEATURE_IDX, features[UNKNOWN_FEATURE_IDX]),
+        );
+        assert_eq!(xstate_iter.next(), None);
+        assert_eq!(xstate_iter.next(), None);
     }
 
     #[test]
     fn test_elf_build_id() {
         // Add a module with a long ELF build id
         let name1 = DumpString::new("module 1", Endian::Little);
-        const MODULE1_BUILD_ID: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                                          0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-                                          0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+        const MODULE1_BUILD_ID: &[u8] = &[
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        ];
         let cv_record1 = Section::with_endian(Endian::Little)
-            .D32(md::CvSignature::Elf as u32)  // signature
+            .D32(md::CvSignature::Elf as u32) // signature
             .append_bytes(MODULE1_BUILD_ID);
         let module1 = SynthModule::new(
             Endian::Little,
@@ -1896,12 +3236,13 @@ mod test {
             0xb1054d2a,
             0x34571371,
             Some(&STOCK_VERSION_INFO),
-        ).cv_record(&cv_record1);
+        )
+        .cv_record(&cv_record1);
         // Add a module with a short ELF build id
         let name2 = DumpString::new("module 2", Endian::Little);
         const MODULE2_BUILD_ID: &[u8] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
         let cv_record2 = Section::with_endian(Endian::Little)
-            .D32(md::CvSignature::Elf as u32)  // signature
+            .D32(md::CvSignature::Elf as u32) // signature
             .append_bytes(MODULE2_BUILD_ID);
         let module2 = SynthModule::new(
             Endian::Little,
@@ -1911,7 +3252,8 @@ mod test {
             0xb1054d2a,
             0x34571371,
             Some(&STOCK_VERSION_INFO),
-        ).cv_record(&cv_record2);
+        )
+        .cv_record(&cv_record2);
         let dump = SynthMinidump::with_endian(Endian::Little)
             .add_module(module1)
             .add_module(module2)
@@ -1926,12 +3268,16 @@ mod test {
         assert_eq!(modules[0].base_address(), 0x100000000);
         assert_eq!(modules[0].code_file(), "module 1");
         // The full build ID.
-        assert_eq!(modules[0].code_identifier(),
-                   "000102030405060708090a0b0c0d0e0f1011121314151617");
+        assert_eq!(
+            modules[0].code_identifier(),
+            "000102030405060708090a0b0c0d0e0f1011121314151617"
+        );
         assert_eq!(modules[0].debug_file().unwrap(), "module 1");
         // The first 16 bytes of the build ID interpreted as a GUID.
-        assert_eq!(modules[0].debug_identifier().unwrap(),
-                   "030201000504070608090A0B0C0D0E0F0");
+        assert_eq!(
+            modules[0].debug_identifier().unwrap(),
+            "030201000504070608090A0B0C0D0E0F0"
+        );
 
         assert_eq!(modules[1].base_address(), 0x200000000);
         assert_eq!(modules[1].code_file(), "module 2");
@@ -1940,8 +3286,10 @@ mod test {
         assert_eq!(modules[1].debug_file().unwrap(), "module 2");
         // The first 16 bytes of the build ID interpreted as a GUID, padded with
         // zeroes in this case.
-        assert_eq!(modules[1].debug_identifier().unwrap(),
-                   "030201000504070600000000000000000");
+        assert_eq!(
+            modules[1].debug_identifier().unwrap(),
+            "030201000504070600000000000000000"
+        );
     }
 
     #[test]
@@ -1957,7 +3305,7 @@ mod test {
             .add(context)
             .add_memory(stack);
         let dump = read_synth_dump(dump).unwrap();
-        let mut thread_list = dump.get_stream::<MinidumpThreadList>().unwrap();
+        let mut thread_list = dump.get_stream::<MinidumpThreadList<'_>>().unwrap();
         assert_eq!(thread_list.threads.len(), 1);
         let mut thread = thread_list.threads.pop().unwrap();
         assert_eq!(thread.raw.thread_id, 0x1234);
@@ -1967,7 +3315,7 @@ mod test {
                 assert_eq!(raw.eip, 0xabcd1234);
                 assert_eq!(raw.esp, 0x1010);
             }
-            _ => assert!(false, "Got unexpected raw context type!"),
+            _ => panic!("Got unexpected raw context type!"),
         }
         let stack = thread.stack.take().expect("Should have stack memory");
         assert_eq!(stack.base_address, 0x1000);
@@ -1976,8 +3324,8 @@ mod test {
 
     #[test]
     fn test_thread_list_amd64() {
-        let context = synth_minidump::amd64_context(Endian::Little, 0x1234abcd1234abcd,
-                                                    0x1000000010000000);
+        let context =
+            synth_minidump::amd64_context(Endian::Little, 0x1234abcd1234abcd, 0x1000000010000000);
         let stack = Memory::with_section(
             Section::with_endian(Endian::Little).append_repeated(0, 0x1000),
             0x1000000010000000,
@@ -1988,20 +3336,93 @@ mod test {
             .add(context)
             .add_memory(stack);
         let dump = read_synth_dump(dump).unwrap();
-        let mut thread_list = dump.get_stream::<MinidumpThreadList>().unwrap();
+        let mut thread_list = dump.get_stream::<MinidumpThreadList<'_>>().unwrap();
         assert_eq!(thread_list.threads.len(), 1);
         let mut thread = thread_list.threads.pop().unwrap();
         assert_eq!(thread.raw.thread_id, 0x1234);
         let context = thread.context.expect("Should have a thread context");
         match context.raw {
-            MinidumpRawContext::AMD64(raw) => {
+            MinidumpRawContext::Amd64(raw) => {
                 assert_eq!(raw.rip, 0x1234abcd1234abcd);
                 assert_eq!(raw.rsp, 0x1000000010000000);
             }
-            _ => assert!(false, "Got unexpected raw context type!"),
+            _ => panic!("Got unexpected raw context type!"),
         }
         let stack = thread.stack.take().expect("Should have stack memory");
         assert_eq!(stack.base_address, 0x1000000010000000);
         assert_eq!(stack.size, 0x1000);
+    }
+
+    #[test]
+    fn test_crashpad_info_missing() {
+        let dump = SynthMinidump::with_endian(Endian::Little);
+        let dump = read_synth_dump(dump).unwrap();
+
+        assert!(matches!(
+            dump.get_stream::<MinidumpCrashpadInfo>(),
+            Err(Error::StreamNotFound)
+        ));
+    }
+
+    #[test]
+    fn test_crashpad_info_ids() {
+        let report_id = GUID {
+            data1: 1,
+            data2: 2,
+            data3: 3,
+            data4: [4, 5, 6, 7, 8, 9, 10, 11],
+        };
+
+        let client_id = GUID {
+            data1: 11,
+            data2: 10,
+            data3: 9,
+            data4: [8, 7, 6, 5, 4, 3, 2, 1],
+        };
+
+        let crashpad_info = CrashpadInfo::new(Endian::Little)
+            .report_id(report_id)
+            .client_id(client_id);
+
+        let dump = SynthMinidump::with_endian(Endian::Little).add_crashpad_info(crashpad_info);
+        let dump = read_synth_dump(dump).unwrap();
+
+        let crashpad_info = dump.get_stream::<MinidumpCrashpadInfo>().unwrap();
+
+        assert_eq!(crashpad_info.raw.report_id, report_id);
+        assert_eq!(crashpad_info.raw.client_id, client_id);
+    }
+
+    #[test]
+    fn test_crashpad_info_annotations() {
+        let module = ModuleCrashpadInfo::new(42, Endian::Little)
+            .add_list_annotation("annotation")
+            .add_simple_annotation("simple", "module")
+            .add_annotation_object("string", AnnotationValue::String("value".to_owned()))
+            .add_annotation_object("invalid", AnnotationValue::Invalid)
+            .add_annotation_object("custom", AnnotationValue::Custom(0x8001, vec![42]));
+
+        let crashpad_info = CrashpadInfo::new(Endian::Little)
+            .add_module(module)
+            .add_simple_annotation("simple", "info");
+
+        let dump = SynthMinidump::with_endian(Endian::Little).add_crashpad_info(crashpad_info);
+        let dump = read_synth_dump(dump).unwrap();
+
+        let crashpad_info = dump.get_stream::<MinidumpCrashpadInfo>().unwrap();
+        let module = &crashpad_info.module_list[0];
+
+        assert_eq!(crashpad_info.simple_annotations["simple"], "info");
+        assert_eq!(module.module_index, 42);
+        assert_eq!(module.list_annotations, vec!["annotation".to_owned()]);
+        assert_eq!(module.simple_annotations["simple"], "module");
+        assert_eq!(
+            module.annotation_objects["string"],
+            MinidumpAnnotation::String("value".to_owned())
+        );
+        assert_eq!(
+            module.annotation_objects["invalid"],
+            MinidumpAnnotation::Invalid
+        );
     }
 }

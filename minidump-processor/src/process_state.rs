@@ -3,20 +3,22 @@
 
 //! The state of a process.
 
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashSet;
-use std::io::prelude::*;
 use std::io;
+use std::io::prelude::*;
 
+use crate::system_info::SystemInfo;
 use breakpad_symbols::FrameSymbolizer;
 use chrono::prelude::*;
+use minidump::system_info::Cpu;
 use minidump::*;
-use system_info::SystemInfo;
+use serde_json::json;
 
 /// Indicates how well the instruction pointer derived during
 /// stack walking is trusted. Since the stack walker can resort to
 /// stack scanning, it can wind up with dubious frames.
-#[derive(Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum FrameTrust {
     /// Unknown
     None,
@@ -35,6 +37,7 @@ pub enum FrameTrust {
 }
 
 /// A single stack frame produced from unwinding a thread's stack.
+#[derive(Debug)]
 pub struct StackFrame {
     // The program counter location as an absolute virtual address.
     //
@@ -69,6 +72,10 @@ pub struct StackFrame {
     /// are not available.
     pub function_base: Option<u64>,
 
+    /// The size, in bytes, of the arguments pushed on the stack for this function.
+    /// WIN STACK unwinding needs this value to work; it's otherwise uninteresting.
+    pub parameter_size: Option<u32>,
+
     /// The source file name, may be omitted if debug symbols are not available.
     pub source_file_name: Option<String>,
 
@@ -98,7 +105,7 @@ pub enum CallStackInfo {
     /// No stack memory was provided, couldn't unwind past the top frame.
     MissingMemory,
     /// The CPU type is unsupported.
-    UnsupportedCPU,
+    UnsupportedCpu,
     /// This thread wrote the minidump, it was skipped.
     DumpThreadSkipped,
 }
@@ -116,6 +123,8 @@ pub struct CallStack {
 
 /// The state of a process as recorded by a `Minidump`.
 pub struct ProcessState {
+    /// The PID of the process.
+    pub process_id: Option<u32>,
     /// When the minidump was written.
     pub time: DateTime<Utc>,
     /// When the process started, if available
@@ -151,6 +160,7 @@ pub struct ProcessState {
     /// The modules that were loaded into the process represented by the
     /// `ProcessState`.
     pub modules: MinidumpModuleList,
+    pub unloaded_modules: MinidumpUnloadedModuleList,
     // modules_without_symbols
     // modules_with_corrupt_symbols
     // exploitability
@@ -170,6 +180,18 @@ impl FrameTrust {
             FrameTrust::None => "unknown",
         }
     }
+
+    fn json_name(&self) -> &'static str {
+        match *self {
+            FrameTrust::Context => "context",
+            FrameTrust::PreWalked => "prewalked",
+            FrameTrust::CallFrameInfo => "cfi",
+            FrameTrust::CfiScan => "cfi_scan",
+            FrameTrust::FramePointer => "frame_pointer",
+            FrameTrust::Scan => "scan",
+            FrameTrust::None => "non",
+        }
+    }
 }
 
 impl StackFrame {
@@ -180,11 +202,12 @@ impl StackFrame {
             module: None,
             function_name: None,
             function_base: None,
+            parameter_size: None,
             source_file_name: None,
             source_line: None,
             source_line_base: None,
-            trust: trust,
-            context: context,
+            trust,
+            context,
         }
     }
 
@@ -199,9 +222,10 @@ impl FrameSymbolizer for StackFrame {
     fn get_instruction(&self) -> u64 {
         self.instruction
     }
-    fn set_function(&mut self, name: &str, base: u64) {
+    fn set_function(&mut self, name: &str, base: u64, parameter_size: u32) {
         self.function_name = Some(String::from(name));
         self.function_base = Some(base);
+        self.parameter_size = Some(parameter_size);
     }
     fn set_source_file(&mut self, file: &str, line: u32, base: u64) {
         self.source_file_name = Some(String::from(file));
@@ -247,11 +271,31 @@ fn print_registers<T: Write>(f: &mut T, ctx: &MinidumpContext) -> io::Result<()>
     Ok(())
 }
 
+fn json_registers(ctx: &MinidumpContext) -> serde_json::Value {
+    let registers: Cow<HashSet<&str>> = match ctx.valid {
+        MinidumpContextValidity::All => {
+            let gpr = ctx.general_purpose_registers();
+            let set: HashSet<&str> = gpr.iter().cloned().collect();
+            Cow::Owned(set)
+        }
+        MinidumpContextValidity::Some(ref which) => Cow::Borrowed(which),
+    };
+
+    let mut output = serde_json::Map::new();
+    for &reg in ctx.general_purpose_registers() {
+        if registers.contains(reg) {
+            let reg_val = ctx.format_register(reg);
+            output.insert(String::from(reg), json!(reg_val));
+        }
+    }
+    json!(output)
+}
+
 impl CallStack {
     /// Create a `CallStack` with `info` and no frames.
     pub fn with_info(info: CallStackInfo) -> CallStack {
         CallStack {
-            info: info,
+            info,
             frames: vec![],
         }
     }
@@ -261,7 +305,7 @@ impl CallStack {
     /// This is very verbose, it implements the output format used by
     /// minidump_stackwalk.
     pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
-        if self.frames.len() == 0 {
+        if self.frames.is_empty() {
             writeln!(f, "<no frames>")?;
         }
         for (i, frame) in self.frames.iter().enumerate() {
@@ -298,7 +342,7 @@ impl CallStack {
             } else {
                 writeln!(f, "{:#x}", addr)?;
             }
-            writeln!(f, "")?;
+            writeln!(f)?;
             print_registers(f, &frame.context)?;
             writeln!(f, "    Found by: {}", frame.trust.description())?;
         }
@@ -323,11 +367,7 @@ impl ProcessState {
     /// This is very verbose, it implements the output format used by
     /// minidump_stackwalk.
     pub fn print<T: Write>(&self, f: &mut T) -> io::Result<()> {
-        writeln!(
-            f,
-            "Operating system: {}",
-            self.system_info.os.long_name()
-        )?;
+        writeln!(f, "Operating system: {}", self.system_info.os.long_name())?;
         if let Some(ref ver) = self.system_info.os_version {
             writeln!(f, "                  {}", ver)?;
         }
@@ -345,7 +385,7 @@ impl ProcessState {
                 ""
             }
         )?;
-        writeln!(f, "")?;
+        writeln!(f)?;
 
         if let (&Some(ref reason), &Some(ref address)) = (&self.crash_reason, &self.crash_address) {
             write!(
@@ -363,15 +403,11 @@ Crash address: {:#x}
         }
         if let Some(ref time) = self.process_create_time {
             let uptime = self.time - *time;
-            writeln!(
-                f,
-                "Process uptime: {} seconds",
-                uptime.num_seconds()
-            )?;
+            writeln!(f, "Process uptime: {} seconds", uptime.num_seconds())?;
         } else {
             writeln!(f, "Process uptime: not available")?;
         }
-        writeln!(f, "")?;
+        writeln!(f)?;
 
         if let Some(requesting_thread) = self.requesting_thread {
             writeln!(
@@ -385,7 +421,7 @@ Crash address: {:#x}
                 }
             )?;
             self.threads[requesting_thread].print(f)?;
-            writeln!(f, "")?;
+            writeln!(f)?;
         }
         for (i, stack) in self.threads.iter().enumerate() {
             if eq_some(self.requesting_thread, i) {
@@ -404,9 +440,7 @@ Crash address: {:#x}
 Loaded modules:
 "
         )?;
-        let main_address = self.modules
-            .main_module()
-            .and_then(|m| Some(m.base_address()));
+        let main_address = self.modules.main_module().map(|m| m.base_address());
         for module in self.modules.by_addr() {
             // TODO: missing symbols, corrupt symbols
             write!(
@@ -420,8 +454,211 @@ Loaded modules:
             if eq_some(main_address, module.base_address()) {
                 write!(f, "  (main)")?;
             }
-            writeln!(f, "")?;
+            writeln!(f)?;
+        }
+        write!(
+            f,
+            "
+Unloaded modules:
+"
+        )?;
+        for module in self.unloaded_modules.by_addr() {
+            writeln!(
+                f,
+                "{:#010x} - {:#010x}  {}",
+                module.base_address(),
+                module.base_address() + module.size() - 1,
+                basename(&module.code_file()),
+            )?;
         }
         Ok(())
+    }
+
+    /// Outputs json in a schema compatible with mozilla's Socorro crash reporting servers.
+    pub fn print_json<T: Write>(&self, f: &mut T, pretty: bool) -> Result<(), serde_json::Error> {
+        let sys = &self.system_info;
+
+        // Curry self for use in `map`
+        let json_hex = |val: u64| -> String { self.json_hex(val) };
+
+        let mut output = json!({
+            // TODO: I guess we should still produce some JSON in some failure modes?
+            // OK | ERROR_* | SYMBOL_SUPPLIER_INTERRUPTED
+            "status": "OK",
+            "system_info": {
+                // Linux | Windows NT | Mac OS X
+                "os": sys.os.long_name(),
+                "os_ver": sys.os_version,
+                // x86 | amd64 | arm | ppc | sparc
+                "cpu_arch": sys.cpu.to_string(),
+                "cpu_info": sys.cpu_info,
+                "cpu_count": sys.cpu_count,
+                // TODO: Issue #19
+                // optional
+                "cpu_microcode_version": null,
+            },
+            "crash_info": {
+                // TODO: Issue #22
+                "type": "TODO",
+                "address": self.crash_address.map(json_hex),
+                // thread index | null
+                "crashing_thread": self.requesting_thread,
+                "assertion": self.assertion,
+            },
+
+            // optional, Linux Standard Base information
+            // TODO: Issue #172
+            // "lsb_release": {
+            //   "id": <string>,
+            //   "release": <string>,
+            //   "codename": <string>,
+            //   "description": <string>
+            // },
+
+            // the first module is always the main one
+            "main_module": 0,
+            // TODO: Issue #171
+            "modules_contains_cert_info": false,
+            "modules": self.modules.iter().map(|module| json!({
+                "base_addr": json_hex(module.raw.base_of_image),
+                // filename | empty string
+                "debug_file": basename(module.debug_file().unwrap_or(Cow::Borrowed("")).borrow()),
+                // [[:xdigit:]]{33} | empty string
+                "debug_id": module.debug_identifier().unwrap_or(Cow::Borrowed("")),
+                "end_addr": json_hex(module.raw.base_of_image + module.raw.size_of_image as u64),
+                "filename": module.name,
+                "code_id": module.code_identifier(),
+                "version": module.version(),
+
+                // These are all just metrics for debugging minidump-processor's execution
+
+                // optional, if mdsw looked for the file and it does exist
+                // "loaded_symbols": true,
+                // optional, if mdsw looked for the file and it doesn't exist
+                // "missing_symbols": true,
+                // optional, if mdsw found a file that has parse errors
+                // "corrupt_symbols": true,
+                // optional, whether or not the SYM file was fetched from disk cache
+                // "symbol_disk_cache_hit": <bool>,
+                // optional, time in ms it took to fetch symbol file from url; omitted
+                // if the symbol file was in disk cache
+                // "symbols_fetch_time": <float>,
+                // optional, url of symbol file
+                // "symbol_url": <string>
+
+                // TODO: Issue #171
+                // optional
+                // "cert_subject": <string>
+
+            })).collect::<Vec<_>>(),
+            "pid": self.process_id,
+            "thread_count": self.threads.len(),
+            "threads": self.threads.iter().map(|thread| json!({
+                "frame_count": thread.frames.len(),
+                // TODO: I think this is legacy gunk that we don't ever do?
+                "frames_truncated": false,
+                // optional, if truncated, this is the original total
+                "total_frames": thread.frames.len(),
+                // TODO: Issue #156
+                // optional
+                "last_error_value": null,
+                // TODO: Issue #173
+                // optional
+                "thread_name": null,
+                "frames": thread.frames.iter().enumerate().map(|(idx, frame)| json!({
+                    "frame": idx,
+                    // optional
+                    "module": frame.module.as_ref().map(|module| basename(&module.name)),
+                    // optional
+                    "function": frame.function_name,
+                    // optional
+                    "file": frame.source_file_name,
+                    // optional
+                    "line": frame.source_line,
+                    "offset": json_hex(frame.instruction),
+                    // optional
+                    "module_offset": frame
+                        .module
+                        .as_ref()
+                        .map(|module| frame.instruction - module.raw.base_of_image)
+                        .map(json_hex),
+                    // optional
+                    "function_offset": frame
+                        .function_base
+                        .map(|func_base| frame.instruction - func_base)
+                        .map(json_hex),
+                    "missing_symbols": frame.function_name.is_none(),
+                    // none | scan | cfi_scan | frame_pointer | cfi | context | prewalked
+                    "trust": frame.trust.json_name(),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+
+            // TODO: Issue #169
+            // "largest_free_vm_block": 0x000000
+            // "tiny_block_size": <int>,
+            // "write_combine_size": <int>,
+
+            "unloaded_modules": self.unloaded_modules.iter().map(|module| json!({
+                "base_addr": json_hex(module.raw.base_of_image),
+                "code_id": module.code_identifier(),
+                "end_addr": json_hex(module.raw.base_of_image + module.raw.size_of_image as u64),
+                "filename": module.name,
+            })).collect::<Vec<_>>(),
+
+            "sensitive": {
+                // TODO: Issue #25
+                // low | medium | high | interesting | none | ERROR: *
+                "exploitability": "TODO",
+            }
+        });
+
+        if let Some(requesting_thread) = self.requesting_thread {
+            // Copy the crashing thread into a top-level "crashing_thread" field and:
+            // * Add a "thread_index" field to indicate which thread it was
+            // * Add a "registers" field to its first frame
+            //
+            // Note that we currently make crashing_thread a strict superset
+            // of a normal "threads" entry, while the original schema strips
+            // many of the fields here. We don't to keep things more uniform.
+
+            let registers = json_registers(&self.threads[requesting_thread].frames[0].context);
+
+            // Yuck, spidering through json...
+            let mut thread =
+                output.get_mut("threads").unwrap().as_array().unwrap()[requesting_thread].clone();
+            let thread_obj = thread.as_object_mut().unwrap();
+            let frames = thread_obj
+                .get_mut("frames")
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
+            let frame = frames[0].as_object_mut().unwrap();
+
+            frame.insert(String::from("registers"), registers);
+            thread_obj.insert(String::from("thread_index"), json!(requesting_thread));
+
+            output
+                .as_object_mut()
+                .unwrap()
+                .insert(String::from("crashing_thread"), thread);
+        }
+
+        if pretty {
+            serde_json::to_writer_pretty(f, &output)
+        } else {
+            serde_json::to_writer(f, &output)
+        }
+    }
+
+    // Convert an integer to a hex string, with leading 0's for uniform width.
+    fn json_hex(&self, val: u64) -> String {
+        match self.system_info.cpu {
+            Cpu::X86 | Cpu::Ppc | Cpu::Sparc | Cpu::Arm => {
+                format!("0x{:08x}", val)
+            }
+            Cpu::X86_64 | Cpu::Ppc64 | Cpu::Arm64 | Cpu::Unknown(_) => {
+                format!("0x{:016x}", val)
+            }
+        }
     }
 }

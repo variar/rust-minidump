@@ -1,4 +1,4 @@
-[![Build Status](https://travis-ci.org/luser/rust-minidump.svg?branch=master)](https://travis-ci.org/luser/rust-minidump) [![crates.io](https://img.shields.io/crates/v/minidump.svg)](https://crates.io/crates/minidump) [![](https://docs.rs/minidump/badge.svg)](https://docs.rs/minidump)
+![Rust CI](https://github.com/luser/rust-minidump/workflows/Rust%20CI/badge.svg?branch=master) [![crates.io](https://img.shields.io/crates/v/minidump.svg)](https://crates.io/crates/minidump) [![](https://docs.rs/minidump/badge.svg)](https://docs.rs/minidump)
 
 # Overview
 
@@ -6,15 +6,11 @@ This Rust crate implements a parser for the [minidump](https://msdn.microsoft.co
 
 It's fairly heavily modeled after the [Google Breakpad](https://chromium.googlesource.com/breakpad/breakpad/) library, and much of it was written as a means to learn Rust, so there are some rough edges, but it implements most of the functionality necessary to work with minidumps.
 
-[Documentation for master](http://luser.github.io/rust-project-docs/minidump/minidump/)
-
 # Examples
 
 Print the raw details of the exception stream from a minidump:
 
 ```rust
-extern crate minidump;
-
 use minidump::{Error, Minidump, MinidumpException, MinidumpStream};
 use std::io::{self, Write};
 

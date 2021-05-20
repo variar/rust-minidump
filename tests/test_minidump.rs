@@ -1,23 +1,16 @@
 // Copyright 2015 Ted Mielczarek. See the COPYRIGHT
 // file at the top-level directory of this distribution.
 
-extern crate chrono;
-extern crate failure;
-extern crate memmap;
-extern crate minidump;
-extern crate minidump_common;
-extern crate num_traits;
-
 use chrono::prelude::*;
 use memmap::Mmap;
+use minidump::system_info::{Cpu, Os};
+use minidump::*;
+use minidump_common::format as md;
+use minidump_common::traits::Module;
 use num_traits::cast::FromPrimitive;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
-use minidump::*;
-use minidump_common::format as md;
-use minidump::system_info::{Cpu, Os};
-use minidump_common::traits::Module;
 
 fn get_test_minidump_path(filename: &str) -> PathBuf {
     let mut path = PathBuf::from(file!());
@@ -128,17 +121,22 @@ fn test_system_info() {
     let system_info = dump.get_stream::<MinidumpSystemInfo>().unwrap();
     assert_eq!(system_info.os, Os::Windows);
     assert_eq!(system_info.cpu, Cpu::X86);
+    assert_eq!(
+        system_info.cpu_info().unwrap(),
+        "GenuineIntel family 6 model 13 stepping 8"
+    );
+    assert_eq!(system_info.csd_version(), None);
 }
 
 #[test]
 fn test_misc_info() {
     let dump = read_test_minidump().unwrap();
     let misc_info = dump.get_stream::<MinidumpMiscInfo>().unwrap();
-    assert_eq!(misc_info.raw.process_id(), Some(3932));
-    assert_eq!(misc_info.raw.process_create_time(), Some(0x45d35f73));
+    assert_eq!(misc_info.raw.process_id(), Some(&3932));
+    assert_eq!(misc_info.raw.process_create_time(), Some(&0x45d35f73));
     assert_eq!(
         misc_info.process_create_time().unwrap(),
-        Utc.ymd(2007, 02, 14).and_hms(19, 13, 55)
+        Utc.ymd(2007, 2, 14).and_hms(19, 13, 55)
     );
 }
 
@@ -151,16 +149,53 @@ fn test_breakpad_info() {
 }
 
 #[test]
+fn test_crashpad_info() {
+    let path = get_test_minidump_path("simple-crashpad.dmp");
+    let dump = Minidump::read_path(&path).unwrap();
+    let crashpad_info = dump.get_stream::<MinidumpCrashpadInfo>().unwrap();
+
+    let report_id = md::GUID {
+        data1: 0x42F9_DE72,
+        data2: 0x518A,
+        data3: 0x43DD,
+        data4: [0x97, 0xD7, 0x8D, 0xDC, 0x32, 0x8D, 0x36, 0x62],
+    };
+    assert_eq!(crashpad_info.raw.report_id, report_id);
+
+    let client_id = md::GUID {
+        data1: 0x6FD2_B3B9,
+        data2: 0x9833,
+        data3: 0x4B2F,
+        data4: [0xBB, 0xF7, 0xB, 0xCF, 0x50, 0x1B, 0xAD, 0x7E],
+    };
+    assert_eq!(crashpad_info.raw.client_id, client_id);
+
+    assert_eq!(crashpad_info.simple_annotations["hello"], "world");
+    assert_eq!(crashpad_info.module_list.len(), 2);
+
+    let module = &crashpad_info.module_list[0];
+    assert_eq!(module.module_index, 16);
+    assert_eq!(module.list_annotations, vec!["abort() called".to_owned()]);
+    assert!(module.simple_annotations.is_empty());
+    assert!(module.annotation_objects.is_empty());
+}
+
+#[test]
 fn test_assertion() {
     let path = get_test_minidump_path("invalid-parameter.dmp");
     let dump = Minidump::read_path(&path).unwrap();
     let assertion = dump.get_stream::<MinidumpAssertion>().unwrap();
     assert_eq!(assertion.expression().unwrap(), "format != nullptr");
     assert_eq!(assertion.function().unwrap(), "common_vfprintf");
-    assert_eq!(assertion.file().unwrap(), r"minkernel\crts\ucrt\src\appcrt\stdio\output.cpp");
+    assert_eq!(
+        assertion.file().unwrap(),
+        r"minkernel\crts\ucrt\src\appcrt\stdio\output.cpp"
+    );
     assert_eq!(assertion.raw.line, 32);
-    assert_eq!(md::AssertionType::from_u32(assertion.raw._type),
-               Some(md::AssertionType::InvalidParameter));
+    assert_eq!(
+        md::AssertionType::from_u32(assertion.raw._type),
+        Some(md::AssertionType::InvalidParameter)
+    );
 }
 
 #[test]
@@ -172,26 +207,26 @@ fn test_exception() {
     if let Some(ref ctx) = exception.context {
         assert_eq!(ctx.get_instruction_pointer(), 0x40429e);
         assert_eq!(ctx.get_stack_pointer(), 0x12fe84);
-        if let &MinidumpContext {
+        if let MinidumpContext {
             raw: MinidumpRawContext::X86(ref raw),
             ref valid,
-        } = ctx
+        } = *ctx
         {
             assert_eq!(raw.eip, 0x40429e);
             assert_eq!(*valid, MinidumpContextValidity::All);
         } else {
-            assert!(false, "Wrong context type");
+            panic!("Wrong context type");
         }
     } else {
-        assert!(false, "Missing context");
+        panic!("Missing context");
     }
 }
 
 #[test]
 fn test_thread_list() {
     let dump = read_test_minidump().unwrap();
-    let thread_list = dump.get_stream::<MinidumpThreadList>().unwrap();
-    let ref threads = thread_list.threads;
+    let thread_list = dump.get_stream::<MinidumpThreadList<'_>>().unwrap();
+    let threads = &thread_list.threads;
     assert_eq!(threads.len(), 2);
     assert_eq!(threads[0].raw.thread_id, 0xbf4);
     assert_eq!(threads[1].raw.thread_id, 0x11c0);
@@ -200,18 +235,18 @@ fn test_thread_list() {
     if let Some(ref ctx) = threads[0].context {
         assert_eq!(ctx.get_instruction_pointer(), 0x7c90eb94);
         assert_eq!(ctx.get_stack_pointer(), 0x12f320);
-        if let &MinidumpContext {
+        if let MinidumpContext {
             raw: MinidumpRawContext::X86(ref raw),
             ref valid,
-        } = ctx
+        } = *ctx
         {
             assert_eq!(raw.eip, 0x7c90eb94);
             assert_eq!(*valid, MinidumpContextValidity::All);
         } else {
-            assert!(false, "Wrong context type");
+            panic!("Wrong context type");
         }
     } else {
-        assert!(false, "Missing context");
+        panic!("Missing context");
     }
     if let Some(ref stack) = threads[0].stack {
         // Try the beginning
@@ -231,7 +266,7 @@ fn test_thread_list() {
             0x405443
         );
     } else {
-        assert!(false, "Missing stack memory");
+        panic!("Missing stack memory");
     }
 }
 

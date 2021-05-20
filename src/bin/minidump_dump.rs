@@ -2,16 +2,13 @@
 // file at the top-level directory of this distribution.
 
 use std::env;
-use std::path::Path;
 use std::io::{self, Write};
+use std::path::Path;
 use std::str;
-
-extern crate minidump;
-extern crate minidump_common;
 
 use minidump::*;
 
-const USAGE: &'static str = "Usage: minidump_dump <minidump>";
+const USAGE: &str = "Usage: minidump_dump <minidump>";
 
 macro_rules! streams {
     ( $( $x:ident ),* ) => {
@@ -34,13 +31,13 @@ fn print_minidump_dump(path: &Path) {
         Ok(dump) => {
             let stdout = &mut std::io::stdout();
             dump.print(stdout).unwrap();
-            if let Ok(thread_list) = dump.get_stream::<MinidumpThreadList>() {
+            if let Ok(thread_list) = dump.get_stream::<MinidumpThreadList<'_>>() {
                 thread_list.print(stdout).unwrap();
             }
             if let Ok(module_list) = dump.get_stream::<MinidumpModuleList>() {
                 module_list.print(stdout).unwrap();
             }
-            if let Ok(memory_list) = dump.get_stream::<MinidumpMemoryList>() {
+            if let Ok(memory_list) = dump.get_stream::<MinidumpMemoryList<'_>>() {
                 memory_list.print(stdout).unwrap();
             }
             // TODO: MemoryList
@@ -60,6 +57,11 @@ fn print_minidump_dump(path: &Path) {
                 breakpad_info.print(stdout).unwrap();
             }
             // TODO: MemoryInfoList
+            match dump.get_stream::<MinidumpCrashpadInfo>() {
+                Ok(crashpad_info) => crashpad_info.print(stdout).unwrap(),
+                Err(Error::StreamNotFound) => (),
+                Err(_) => write!(stdout, "MinidumpCrashpadInfo cannot print invalid data").unwrap(),
+            }
             for &(stream, name) in streams!(
                 LinuxCmdLine,
                 LinuxEnviron,

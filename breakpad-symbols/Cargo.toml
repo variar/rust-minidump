@@ -8,6 +8,7 @@ documentation = "https://docs.rs/breakpad-symbols"
 homepage = "https://github.com/luser/rust-minidump"
 repository = "https://github.com/luser/rust-minidump"
 exclude = [ "testdata/*" ]
+edition = "2018"
 
 [badges]
 travis-ci = { repository = "luser/rust-minidump" }
@@ -17,7 +18,7 @@ minidump-common = { version = "0.2.0", path = "../minidump-common" }
 range-map = "0.1.5"
 nom = "~1.2.2"
 log = "0.4.1"
-reqwest = "0.9.0"
+reqwest = { version = "0.11.3", features = ["blocking", "gzip"] }
 failure = "0.1.1"
 
 [dev-dependencies]

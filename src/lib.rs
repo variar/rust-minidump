@@ -19,27 +19,23 @@
 //! [read]: struct.Minidump.html#method.read
 //! [read_path]: struct.Minidump.html#method.read_path
 
-extern crate chrono;
-extern crate encoding;
-#[macro_use]
-extern crate failure;
-extern crate libc;
-extern crate memmap;
-extern crate minidump_common;
-extern crate num_traits;
-extern crate range_map;
-extern crate scroll;
-#[cfg(test)]
-extern crate test_assembler;
+#![warn(missing_debug_implementations)]
+
+#[cfg(doctest)]
+doc_comment::doctest!("../README.md");
+
+pub use scroll::Endian;
 
 mod context;
 mod iostuff;
 mod minidump;
+
+pub use minidump_common::format;
+pub use minidump_common::traits::Module;
+
+pub use crate::iostuff::Readable;
+pub use crate::minidump::*;
+
 #[cfg(test)]
 pub mod synth_minidump;
 pub mod system_info;
-
-pub use iostuff::Readable;
-pub use minidump_common::format;
-pub use minidump_common::traits::Module;
-pub use minidump::*;

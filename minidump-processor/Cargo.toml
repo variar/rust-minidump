@@ -8,6 +8,7 @@ readme = "README.md"
 documentation = "https://docs.rs/minidump-processor"
 homepage = "https://github.com/luser/rust-minidump"
 repository = "https://github.com/luser/rust-minidump"
+edition = "2018"
 
 [badges]
 travis-ci = { repository = "luser/rust-minidump" }
@@ -15,12 +16,18 @@ travis-ci = { repository = "luser/rust-minidump" }
 [dependencies]
 addr2line = "0.7.0"
 breakpad-symbols = { version = "0.1.1", path = "../breakpad-symbols" }
-chrono = "0.4.6"
+chrono = { version = "0.4.6", features = ["serde"] }
+clap = "2.33"
 failure = "0.1.1"
 gimli = "0.16"
+log = "0.4"
 memmap = "0.7.0"
-object = "0.9"
 minidump = { version = "0.2.0", path = ".." }
+object = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+simplelog = "0.9"
+scroll = "0.10.2"
 
 [dev-dependencies]
 test-assembler = "0.1.5"

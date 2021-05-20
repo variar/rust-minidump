@@ -1,22 +1,30 @@
 // Copyright 2015 Ted Mielczarek. See the COPYRIGHT
 // file at the top-level directory of this distribution.
 
-use breakpad_symbols::{FrameSymbolizer, Symbolizer};
 use chrono::{TimeZone, Utc};
-use minidump::{self, *};
-use process_state::{CallStack, CallStackInfo, ProcessState};
-use stackwalker;
+use failure::Fail;
+
 use std::boxed::Box;
 use std::ops::Deref;
-use system_info::SystemInfo;
+
+use breakpad_symbols::{FrameSymbolizer, FrameWalker, Symbolizer};
+use minidump::{self, *};
+
+use crate::process_state::{CallStack, CallStackInfo, ProcessState};
+use crate::stackwalker;
+use crate::system_info::SystemInfo;
 
 pub trait SymbolProvider {
     fn fill_symbol(&self, module: &dyn Module, frame: &mut dyn FrameSymbolizer);
+    fn walk_frame(&self, module: &dyn Module, walker: &mut dyn FrameWalker) -> Option<()>;
 }
 
 impl SymbolProvider for Symbolizer {
     fn fill_symbol(&self, module: &dyn Module, frame: &mut dyn FrameSymbolizer) {
         self.fill_symbol(module, frame);
+    }
+    fn walk_frame(&self, module: &dyn Module, walker: &mut dyn FrameWalker) -> Option<()> {
+        self.walk_frame(module, walker)
     }
 }
 
@@ -40,6 +48,16 @@ impl SymbolProvider for MultiSymbolProvider {
         for p in self.providers.iter() {
             p.fill_symbol(module, frame);
         }
+    }
+
+    fn walk_frame(&self, module: &dyn Module, walker: &mut dyn FrameWalker) -> Option<()> {
+        for p in self.providers.iter() {
+            let result = p.walk_frame(module, walker);
+            if result.is_some() {
+                return result;
+            }
+        }
+        None
     }
 }
 
@@ -67,14 +85,11 @@ impl From<minidump::Error> for ProcessError {
 /// # Examples
 ///
 /// ```
-/// extern crate breakpad_symbols;
-/// extern crate minidump;
-/// extern crate minidump_processor;
-///
 /// use minidump::Minidump;
 /// use std::path::PathBuf;
 /// use breakpad_symbols::{Symbolizer, SimpleSymbolSupplier};
 ///
+/// # std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
 /// # fn foo() -> Result<(), minidump_processor::ProcessError> {
 /// let mut dump = Minidump::read_path("../testdata/test.dmp")?;
 /// let supplier = SimpleSymbolSupplier::new(vec!(PathBuf::from("../testdata/symbols")));
@@ -90,30 +105,51 @@ pub fn process_minidump<'a, T, P>(
     dump: &Minidump<'a, T>,
     symbol_provider: &P,
 ) -> Result<ProcessState, ProcessError>
-    where T: Deref<Target=[u8]> + 'a,
-          P: SymbolProvider,
+where
+    T: Deref<Target = [u8]> + 'a,
+    P: SymbolProvider,
 {
     // Thread list is required for processing.
-    let thread_list = dump.get_stream::<MinidumpThreadList>()
-                          .or(Err(ProcessError::MissingThreadList))?;
+    let thread_list = dump
+        .get_stream::<MinidumpThreadList>()
+        .or(Err(ProcessError::MissingThreadList))?;
     // System info is required for processing.
-    let dump_system_info = dump.get_stream::<MinidumpSystemInfo>()
-                               .or(Err(ProcessError::MissingSystemInfo))?;
+    let dump_system_info = dump
+        .get_stream::<MinidumpSystemInfo>()
+        .or(Err(ProcessError::MissingSystemInfo))?;
+
+    let mut os_version = format!(
+        "{}.{}.{}",
+        dump_system_info.raw.major_version,
+        dump_system_info.raw.minor_version,
+        dump_system_info.raw.build_number
+    );
+    if let Some(csd_version) = dump_system_info.csd_version() {
+        os_version.push(' ');
+        os_version.push_str(&csd_version);
+    }
+
+    let cpu_info = dump_system_info
+        .cpu_info()
+        .map(|string| string.into_owned());
+
     let system_info = SystemInfo {
         os: dump_system_info.os,
-        // TODO
-        os_version: None,
+        os_version: Some(os_version),
         cpu: dump_system_info.cpu,
-        // TODO
-        cpu_info: None,
+        cpu_info,
         cpu_count: dump_system_info.raw.number_of_processors as usize,
     };
     // Process create time is optional.
-    let process_create_time = if let Ok(misc_info) = dump.get_stream::<MinidumpMiscInfo>() {
-        misc_info.process_create_time()
-    } else {
-        None
-    };
+    let (process_id, process_create_time) =
+        if let Ok(misc_info) = dump.get_stream::<MinidumpMiscInfo>() {
+            (
+                misc_info.raw.process_id().cloned(),
+                misc_info.process_create_time(),
+            )
+        } else {
+            (None, None)
+        };
     // If Breakpad info exists in dump, get dump and requesting thread ids.
     let breakpad_info = dump.get_stream::<MinidumpBreakpadInfo>();
     let (dump_thread_id, requesting_thread_id) = if let Ok(info) = breakpad_info {
@@ -124,23 +160,31 @@ pub fn process_minidump<'a, T, P>(
     // Get exception info if it exists.
     let exception_stream = dump.get_stream::<MinidumpException>().ok();
     let exception_ref = exception_stream.as_ref();
-    let (crash_reason, crash_address) = if let Some(exception) = exception_ref {
+    let (crash_reason, crash_address, crashing_thread_id) = if let Some(exception) = exception_ref {
         (
             Some(exception.get_crash_reason(system_info.os)),
             Some(exception.get_crash_address(system_info.os)),
+            Some(exception.get_crashing_thread_id()),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let exception_context = exception_ref.and_then(|e| e.context.as_ref());
     // Get assertion
     let assertion = None;
-    let modules = if let Ok(module_list) = dump.get_stream::<MinidumpModuleList>() {
-        module_list.clone()
-    } else {
+    let modules = match dump.get_stream::<MinidumpModuleList>() {
+        Ok(module_list) => module_list,
         // Just give an empty list, simplifies things.
-        MinidumpModuleList::new()
+        Err(_) => MinidumpModuleList::new(),
     };
+    let unloaded_modules = match dump.get_stream::<MinidumpUnloadedModuleList>() {
+        Ok(module_list) => module_list,
+        // Just give an empty list, simplifies things.
+        Err(_) => MinidumpUnloadedModuleList::new(),
+    };
+
+    let memory_list = dump.get_stream::<MinidumpMemoryList>().ok();
+
     // Get memory list
     let mut threads = vec![];
     let mut requesting_thread = None;
@@ -151,28 +195,43 @@ pub fn process_minidump<'a, T, P>(
             continue;
         }
         // If this thread requested the dump then try to use the exception
-        // context if it exists.
-        let context = if requesting_thread_id.is_some()
-            && requesting_thread_id.unwrap() == thread.raw.thread_id
+        // context if it exists. (prefer the exception stream's thread id over
+        // the breakpad info stream's thread id.)
+        let context = if crashing_thread_id
+            .or(requesting_thread_id)
+            .map(|id| id == thread.raw.thread_id)
+            .unwrap_or(false)
         {
             requesting_thread = Some(i);
-            exception_context.or(thread.context.as_ref())
+            exception_context.or_else(|| thread.context.as_ref())
         } else {
             thread.context.as_ref()
         };
-        let stack = stackwalker::walk_stack(&context, &thread.stack, &modules, symbol_provider);
+
+        let stack = thread.stack.as_ref().or_else(|| {
+            // Windows probably gave us null RVAs for our stack memory descriptors.
+            // If this happens, then we need to look up the memory region by address.
+            let stack_addr = thread.raw.stack.start_of_memory_range;
+            memory_list
+                .as_ref()
+                .and_then(|memory| memory.memory_at_address(stack_addr))
+        });
+
+        let stack = stackwalker::walk_stack(&context, stack, &modules, symbol_provider);
         threads.push(stack);
     }
     // if exploitability enabled, run exploitability analysis
     Ok(ProcessState {
+        process_id,
         time: Utc.timestamp(dump.header.time_date_stamp as i64, 0),
-        process_create_time: process_create_time,
-        crash_reason: crash_reason,
-        crash_address: crash_address,
-        assertion: assertion,
-        requesting_thread: requesting_thread,
-        system_info: system_info,
-        threads: threads,
-        modules: modules,
+        process_create_time,
+        crash_reason,
+        crash_address,
+        assertion,
+        requesting_thread,
+        system_info,
+        threads,
+        modules,
+        unloaded_modules,
     })
 }

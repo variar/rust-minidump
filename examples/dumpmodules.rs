@@ -3,16 +3,13 @@
 
 use std::env;
 use std::ffi::OsStr;
-use std::path::Path;
 use std::io::Write;
-
-extern crate minidump;
-extern crate minidump_common;
+use std::path::Path;
 
 use minidump::*;
 use minidump_common::traits::Module;
 
-const USAGE: &'static str = "Usage: dumpmodules [-v] <minidump>
+const USAGE: &str = "Usage: dumpmodules [-v] <minidump>
 Print full paths of modules from a minidump that were loaded in the crashed
 process.
 
@@ -37,7 +34,7 @@ fn print_minidump_modules<T: AsRef<Path>>(path: T, verbose: Verbose) {
                             print!("{}", debug_id);
                         }
                     }
-                    println!("");
+                    println!();
                 }
             }
         }
@@ -55,7 +52,7 @@ fn main() {
     for arg in env::args_os().skip(1) {
         if arg == OsStr::new("-v") {
             verbose = Verbose::Yes;
-        } else if arg.to_str().map(|s| s.starts_with("-")).unwrap_or(false) {
+        } else if arg.to_str().map(|s| s.starts_with('-')).unwrap_or(false) {
             writeln!(&mut stderr, "Unknown argument {:?}", arg).unwrap();
             break;
         } else {

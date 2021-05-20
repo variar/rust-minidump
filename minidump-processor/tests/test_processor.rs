@@ -1,17 +1,11 @@
 // Copyright 2015 Ted Mielczarek. See the COPYRIGHT
 // file at the top-level directory of this distribution.
 
-extern crate breakpad_symbols;
-extern crate failure;
-extern crate memmap;
-extern crate minidump;
-extern crate minidump_processor;
-
 use breakpad_symbols::{SimpleSymbolSupplier, Symbolizer};
-use std::path::{Path, PathBuf};
-use minidump::*;
 use minidump::system_info::{Cpu, Os};
+use minidump::*;
 use minidump_processor::{CallStackInfo, FrameTrust};
+use std::path::{Path, PathBuf};
 
 fn locate_testdata() -> PathBuf {
     // This is a little weird because while cargo will always build this code by running rustc
@@ -50,7 +44,8 @@ fn test_processor() {
     let state = minidump_processor::process_minidump(
         &dump,
         &Symbolizer::new(SimpleSymbolSupplier::new(vec![])),
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(state.system_info.os, Os::Windows);
     // TODO
     // assert_eq!(state.system_info.os_version.unwrap(),
@@ -81,7 +76,7 @@ fn test_processor() {
         assert_eq!(raw.eip, 0x0040429e);
         assert_eq!(*valid, MinidumpContextValidity::All);
     } else {
-        assert!(false, "Wrong context type");
+        panic!("Wrong context type");
     }
 
     // Check thread 0, frame 3.
@@ -97,16 +92,16 @@ fn test_processor() {
     } = f3.context
     {
         assert_eq!(raw.eip, 0x7c816fd7);
-        match valid {
-            &MinidumpContextValidity::All => assert!(false, "Should not have all registers valid"),
-            &MinidumpContextValidity::Some(ref which) => {
+        match *valid {
+            MinidumpContextValidity::All => panic!("Should not have all registers valid"),
+            MinidumpContextValidity::Some(ref which) => {
                 assert!(which.contains("eip"));
                 assert!(which.contains("esp"));
                 assert!(which.contains("ebp"));
             }
         }
     } else {
-        assert!(false, "Wrong context type");
+        panic!("Wrong context type");
     }
 
     // The dump thread should have been skipped.
@@ -122,10 +117,11 @@ fn test_processor_symbols() {
     let state = minidump_processor::process_minidump(
         &dump,
         &Symbolizer::new(SimpleSymbolSupplier::new(vec![path])),
-    ).unwrap();
+    )
+    .unwrap();
     let f0 = &state.threads[0].frames[0];
     assert_eq!(
-        f0.function_name.as_ref().map(|s| s.as_str()),
+        f0.function_name.as_deref(),
         Some("`anonymous namespace'::CrashFunction")
     );
 }
