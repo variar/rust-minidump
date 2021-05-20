@@ -47,7 +47,7 @@ jobs:
 
       - name: Set Mac target
         if: ${{ matrix.config.os == 'macos' }} 
-        run: echo "::set-env name=MACOSX_DEPLOYMENT_TARGET::${{ 10.12 }}" 
+        run: echo "MACOSX_DEPLOYMENT_TARGET=10.14" >> $GITHUB_ENV
 
       - name: Build release
         run: cargo build --release
