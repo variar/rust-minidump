@@ -1197,9 +1197,13 @@ Memory
 
     /// Write the contents of this `MinidumpMemory` to `f` as a hex string.
     pub fn print_contents<T: Write>(&self, f: &mut T) -> io::Result<()> {
-        write!(f, "0x")?;
+        let mut counter = 0;
         for byte in self.bytes.iter() {
             write!(f, "{:02x}", byte)?;
+            counter = counter + 1;
+            if counter % 64 == 0 {
+                writeln!(f)?;
+            }
         }
         writeln!(f)?;
         Ok(())

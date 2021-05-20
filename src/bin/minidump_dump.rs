@@ -31,16 +31,7 @@ fn print_minidump_dump(path: &Path) {
         Ok(dump) => {
             let stdout = &mut std::io::stdout();
             dump.print(stdout).unwrap();
-            if let Ok(thread_list) = dump.get_stream::<MinidumpThreadList<'_>>() {
-                thread_list.print(stdout).unwrap();
-            }
-            if let Ok(module_list) = dump.get_stream::<MinidumpModuleList>() {
-                module_list.print(stdout).unwrap();
-            }
-            if let Ok(memory_list) = dump.get_stream::<MinidumpMemoryList<'_>>() {
-                memory_list.print(stdout).unwrap();
-            }
-            // TODO: MemoryList
+
             if let Ok(exception) = dump.get_stream::<MinidumpException>() {
                 exception.print(stdout).unwrap();
             }
@@ -74,6 +65,16 @@ fn print_minidump_dump(path: &Path) {
                     print_raw_stream(name, contents, stdout).unwrap();
                 }
             }
+            if let Ok(thread_list) = dump.get_stream::<MinidumpThreadList<'_>>() {
+                thread_list.print(stdout).unwrap();
+            }
+            if let Ok(module_list) = dump.get_stream::<MinidumpModuleList>() {
+                module_list.print(stdout).unwrap();
+            }
+            if let Ok(memory_list) = dump.get_stream::<MinidumpMemoryList<'_>>() {
+                memory_list.print(stdout).unwrap();
+            }
+            // TODO: MemoryList
         }
         Err(err) => {
             let mut stderr = std::io::stderr();
